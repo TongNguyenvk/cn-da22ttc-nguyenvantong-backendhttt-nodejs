@@ -1,0 +1,986 @@
+{
+	"info": {
+		"_postman_id": "semester-assignment-management",
+		"name": "Semester & Assignment Management APIs",
+		"description": "Collection để test các API mới cho quản lý học kỳ và phân công giáo viên",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "Authentication",
+			"item": [
+				{
+					"name": "Login Admin",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"if (pm.response.code === 200) {",
+									"    const responseJson = pm.response.json();",
+									"    pm.environment.set('authToken', responseJson.token);",
+									"    pm.environment.set('userId', responseJson.user.user_id);",
+									"    pm.environment.set('userRole', responseJson.user.role);",
+									"    console.log('Token saved:', responseJson.token);",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"email\": \"admin@example.com\",\n    \"password\": \"admin123\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/users/login",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"users",
+								"login"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Login Teacher",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"if (pm.response.code === 200) {",
+									"    const responseJson = pm.response.json();",
+									"    pm.environment.set('teacherToken', responseJson.token);",
+									"    pm.environment.set('teacherId', responseJson.user.user_id);",
+									"    console.log('Teacher token saved:', responseJson.token);",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"email\": \"teacher@example.com\",\n    \"password\": \"teacher123\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/users/login",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"users",
+								"login"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Semester Management",
+			"item": [
+				{
+					"name": "Get All Semesters",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/semesters?page=1&limit=10",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"semesters"
+							],
+							"query": [
+								{
+									"key": "page",
+									"value": "1"
+								},
+								{
+									"key": "limit",
+									"value": "10"
+								}
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Active Semester",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"if (pm.response.code === 200) {",
+									"    const responseJson = pm.response.json();",
+									"    if (responseJson.data) {",
+									"        pm.environment.set('activeSemesterId', responseJson.data.semester_id);",
+									"        console.log('Active semester ID saved:', responseJson.data.semester_id);",
+									"    }",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/semesters/active",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"semesters",
+								"active"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Current Semester",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/semesters/current",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"semesters",
+								"current"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Create New Semester",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"if (pm.response.code === 201) {",
+									"    const responseJson = pm.response.json();",
+									"    pm.environment.set('newSemesterId', responseJson.data.semester_id);",
+									"    console.log('New semester ID saved:', responseJson.data.semester_id);",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"name\": \"Học kỳ test {{$timestamp}}\",\n    \"academic_year\": \"2025-2026\",\n    \"semester_number\": 1,\n    \"start_date\": \"2025-09-01\",\n    \"end_date\": \"2026-01-15\",\n    \"description\": \"Học kỳ test được tạo từ Postman\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/semesters",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"semesters"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Semester by ID",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/semesters/{{activeSemesterId}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"semesters",
+								"{{activeSemesterId}}"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Update Semester",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"description\": \"Mô tả đã được cập nhật từ Postman\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/semesters/{{newSemesterId}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"semesters",
+								"{{newSemesterId}}"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Activate Semester",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/semesters/{{newSemesterId}}/activate",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"semesters",
+								"{{newSemesterId}}",
+								"activate"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Semester Statistics",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/semesters/{{activeSemesterId}}/statistics",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"semesters",
+								"{{activeSemesterId}}",
+								"statistics"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Teacher Assignment Management",
+			"item": [
+				{
+					"name": "Get Available Teachers",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"if (pm.response.code === 200) {",
+									"    const responseJson = pm.response.json();",
+									"    if (responseJson.data.teachers && responseJson.data.teachers.length > 0) {",
+									"        pm.environment.set('availableTeacherId', responseJson.data.teachers[0].user_id);",
+									"        console.log('Available teacher ID saved:', responseJson.data.teachers[0].user_id);",
+									"    }",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/assignments/available/teachers",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"assignments",
+								"available",
+								"teachers"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Available Subjects",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"if (pm.response.code === 200) {",
+									"    const responseJson = pm.response.json();",
+									"    if (responseJson.data.subjects && responseJson.data.subjects.length > 0) {",
+									"        pm.environment.set('availableSubjectId', responseJson.data.subjects[0].subject_id);",
+									"        console.log('Available subject ID saved:', responseJson.data.subjects[0].subject_id);",
+									"    }",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/assignments/available/subjects",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"assignments",
+								"available",
+								"subjects"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Create Teacher Assignment",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"if (pm.response.code === 201) {",
+									"    const responseJson = pm.response.json();",
+									"    pm.environment.set('assignmentId', responseJson.data.assignment_id);",
+									"    console.log('Assignment ID saved:', responseJson.data.assignment_id);",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"teacher_id\": {{availableTeacherId}},\n    \"subject_id\": {{availableSubjectId}},\n    \"semester_id\": {{activeSemesterId}},\n    \"note\": \"Phân công từ Postman test\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/assignments",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"assignments"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Assignments by Semester",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/assignments/semester/{{activeSemesterId}}?page=1&limit=10",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"assignments",
+								"semester",
+								"{{activeSemesterId}}"
+							],
+							"query": [
+								{
+									"key": "page",
+									"value": "1"
+								},
+								{
+									"key": "limit",
+									"value": "10"
+								}
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Assignment by ID",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/assignments/{{assignmentId}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"assignments",
+								"{{assignmentId}}"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get My Assignments (Teacher)",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{teacherToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/assignments/my-assignments?semester_id={{activeSemesterId}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"assignments",
+								"my-assignments"
+							],
+							"query": [
+								{
+									"key": "semester_id",
+									"value": "{{activeSemesterId}}"
+								}
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Update Assignment",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"note\": \"Cập nhật ghi chú từ Postman\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/assignments/{{assignmentId}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"assignments",
+								"{{assignmentId}}"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Deactivate Assignment",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/assignments/{{assignmentId}}/deactivate",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"assignments",
+								"{{assignmentId}}",
+								"deactivate"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Assignment Statistics",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/assignments/statistics/semester/{{activeSemesterId}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"assignments",
+								"statistics",
+								"semester",
+								"{{activeSemesterId}}"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Course Management",
+			"item": [
+				{
+					"name": "Get Courses by Semester",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/courses/semester/{{activeSemesterId}}?page=1&limit=10",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"courses",
+								"semester",
+								"{{activeSemesterId}}"
+							],
+							"query": [
+								{
+									"key": "page",
+									"value": "1"
+								},
+								{
+									"key": "limit",
+									"value": "10"
+								}
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get My Courses in Semester (Teacher)",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{teacherToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/courses/semester/{{activeSemesterId}}/my-courses",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"courses",
+								"semester",
+								"{{activeSemesterId}}",
+								"my-courses"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Clonable Courses",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"if (pm.response.code === 200) {",
+									"    const responseJson = pm.response.json();",
+									"    if (responseJson.data.courses && responseJson.data.courses.length > 0) {",
+									"        pm.environment.set('clonableCourseId', responseJson.data.courses[0].course_id);",
+									"        console.log('Clonable course ID saved:', responseJson.data.courses[0].course_id);",
+									"    }",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/courses/clone/available",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"courses",
+								"clone",
+								"available"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Create Course from Assignment",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"if (pm.response.code === 201) {",
+									"    const responseJson = pm.response.json();",
+									"    pm.environment.set('newCourseId', responseJson.data.cloned_course.course_id);",
+									"    console.log('New course ID saved:', responseJson.data.cloned_course.course_id);",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{teacherToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"name\": \"Khóa học từ phân công {{$timestamp}}\",\n    \"description\": \"Khóa học được tạo từ phân công qua Postman\",\n    \"program_id\": 1,\n    \"start_date\": \"2025-09-01\",\n    \"end_date\": \"2026-01-15\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/courses/from-assignment/{{assignmentId}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"courses",
+								"from-assignment",
+								"{{assignmentId}}"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Clone Course",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"if (pm.response.code === 201) {",
+									"    const responseJson = pm.response.json();",
+									"    pm.environment.set('clonedCourseId', responseJson.data.cloned_course.course_id);",
+									"    console.log('Cloned course ID saved:', responseJson.data.cloned_course.course_id);",
+									"}"
+								],
+								"type": "text/javascript"
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"name\": \"Khóa học clone {{$timestamp}}\",\n    \"description\": \"Khóa học được clone từ Postman\",\n    \"semester_id\": {{activeSemesterId}},\n    \"program_id\": 1\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/courses/clone/{{clonableCourseId}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"courses",
+								"clone",
+								"{{clonableCourseId}}"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Set Course as Template",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"is_template\": true\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/api/courses/{{newCourseId}}/set-template",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"courses",
+								"{{newCourseId}}",
+								"set-template"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "Get Clone Statistics",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/courses/{{clonableCourseId}}/clone-statistics",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"courses",
+								"{{clonableCourseId}}",
+								"clone-statistics"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Integration Tests",
+			"item": [
+				{
+					"name": "Full Workflow Test",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{authToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/semesters/{{activeSemesterId}}/statistics",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"semesters",
+								"{{activeSemesterId}}",
+								"statistics"
+							]
+						},
+						"description": "Test tổng thể để kiểm tra luồng hoạt động hoàn chỉnh"
+					},
+					"response": []
+				}
+			]
+		}
+	],
+	"event": [
+		{
+			"listen": "prerequest",
+			"script": {
+				"type": "text/javascript",
+				"exec": [
+					""
+				]
+			}
+		},
+		{
+			"listen": "test",
+			"script": {
+				"type": "text/javascript",
+				"exec": [
+					""
+				]
+			}
+		}
+	],
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:8888",
+			"type": "string"
+		}
+	]
+}

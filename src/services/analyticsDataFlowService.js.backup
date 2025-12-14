@@ -1,0 +1,480 @@
+const {
+    StudentProgramProgress,
+    ProgramOutcomeTracking,
+    SubjectOutcomeAnalysis,
+    LearningAnalytics,
+    QuizResult,
+    UserQuestionHistory,
+    Question,
+    Quiz,
+    Subject,
+    Course,
+    Program,
+    LO,
+    PO,
+    PLO,
+    User,
+    sequelize
+} = require('../models');
+const { Op } = require('sequelize');
+
+class AnalyticsDataFlowService {
+    
+    // =====================================================
+    // REAL-TIME UPDATES (Triggered after quiz completion)
+    // =====================================================
+    
+    /**
+     * Main function called after quiz completion
+     * @param {Object} quizCompletionData - {user_id, quiz_id, score, quiz_result_id}
+     */
+    async processQuizCompletion(quizCompletionData) {
+        const transaction = await sequelize.transaction();
+        try {
+            const { user_id, quiz_id, score, quiz_result_id } = quizCompletionData;
+            
+            console.log(`Processing quiz completion for user ${user_id}, quiz ${quiz_id}`);
+            
+            // Get quiz details with program info
+            const quizDetails = await this.getQuizDetails(quiz_id, transaction);
+            if (!quizDetails) {
+                await transaction.rollback();
+                return { success: false, error: 'Quiz details not found' };
+            }
+            
+            const { program_id, subject_id } = quizDetails;
+            
+            // 1. Update ProgramOutcomeTracking (Real-time)
+            await this.updateProgramOutcomeTracking(user_id, program_id, quiz_id, score, transaction);
+            
+            // 2. Update StudentProgramProgress (Real-time)
+            await this.updateStudentProgramProgress(user_id, program_id, transaction);
+            
+            await transaction.commit();
+            
+            // 3. Schedule background updates (Non-blocking)
+            this.scheduleBackgroundUpdates(program_id, subject_id, user_id);
+            
+            console.log(`Successfully processed quiz completion for user ${user_id}`);
+            return { success: true };
+            
+        } catch (error) {
+            await transaction.rollback();
+            console.error('Error processing quiz completion:', error);
+            return { success: false, error: error.message };
+        }
+    }
+    
+    /**
+     * Update PO/PLO tracking scores based on quiz results
+     */
+    async updateProgramOutcomeTracking(user_id, program_id, quiz_id, overall_score, transaction) {
+        try {
+            // Get all questions in the quiz with their LO mappings
+            const questionHistory = await UserQuestionHistory.findAll({
+                where: { user_id, quiz_id },
+                include: [{
+                    model: Question,
+                    as: 'Question',
+                    include: [{
+                        model: LO,
+                        as: 'LO',
+                        include: [{
+                            model: PLO,
+                            as: 'PLOs',
+                            where: { program_id },
+                            required: false,
+                            through: { attributes: [] }
+                        }]
+                    }]
+                }],
+                transaction
+            });
+            
+            // Group by LO and calculate LO scores
+            const loScores = this.calculateLOScores(questionHistory);
+            
+            // Update PLO tracking based on LO scores
+            for (const [lo_id, loScore] of Object.entries(loScores)) {
+                const question = questionHistory.find(qh => qh.Question.lo_id == lo_id);
+                const plos = question?.Question?.LO?.PLOs || [];
+                
+                for (const plo of plos) {
+                    await this.updatePLOTracking(user_id, program_id, plo.plo_id, loScore, transaction);
+                }
+            }
+            
+            // Get POs associated with this program and update them
+            const pos = await PO.findAll({
+                where: { program_id },
+                transaction
+            });
+            
+            for (const po of pos) {
+                await this.updatePOTracking(user_id, program_id, po.po_id, overall_score, transaction);
+            }
+            
+        } catch (error) {
+            console.error('Error updating program outcome tracking:', error);
+            throw error;
+        }
+    }
+    
+    /**
+     * Update student's overall program progress
+     */
+    async updateStudentProgramProgress(user_id, program_id, transaction) {
+        try {
+            // Get or create student progress record
+            let progress = await StudentProgramProgress.findOne({
+                where: { user_id, program_id },
+                transaction
+            });
+            
+            if (!progress) {
+                progress = await StudentProgramProgress.create({
+                    user_id,
+                    program_id,
+                    overall_progress: {
+                        total_subjects: 0,
+                        completed_subjects: 0,
+                        in_progress_subjects: 0,
+                        completion_percentage: 0,
+                        gpa: 0,
+                        credits_earned: 0,
+                        total_credits_required: 0
+                    },
+                    po_progress: {},
+                    plo_progress: {},
+                    semester_progress: {},
+                    strengths_weaknesses: {
+                        strong_areas: [],
+                        weak_areas: [],
+                        improvement_suggestions: []
+                    },
+                    predictions: {
+                        graduation_probability: 0,
+                        expected_graduation_date: null,
+                        at_risk_subjects: [],
+                        recommended_actions: []
+                    }
+                }, { transaction });
+            }
+            
+            // Calculate updated metrics
+            const updatedMetrics = await this.calculateStudentMetrics(user_id, program_id, transaction);
+            
+            // Update progress record
+            await progress.update({
+                overall_progress: updatedMetrics.overall_progress,
+                po_progress: updatedMetrics.po_progress,
+                plo_progress: updatedMetrics.plo_progress,
+                strengths_weaknesses: updatedMetrics.strengths_weaknesses,
+                predictions: updatedMetrics.predictions,
+                last_updated: new Date()
+            }, { transaction });
+            
+        } catch (error) {
+            console.error('Error updating student program progress:', error);
+            throw error;
+        }
+    }
+    
+    // =====================================================
+    // HELPER FUNCTIONS
+    // =====================================================
+    
+    async getQuizDetails(quiz_id, transaction) {
+        try {
+            const quiz = await Quiz.findByPk(quiz_id, {
+                include: [{
+                    model: Subject,
+                    include: [{
+                        model: Course,
+                        attributes: ['course_id', 'program_id']
+                    }]
+                }],
+                transaction
+            });
+            
+            if (!quiz || !quiz.Subject?.Course) {
+                return null;
+            }
+            
+            return {
+                program_id: quiz.Subject.Course.program_id,
+                // TODO: subject_id deprecated; use quiz.Course.subject_id after migration
+                subject_id: quiz.Subject.subject_id,
+                quiz_name: quiz.name
+            };
+        } catch (error) {
+            console.error('Error getting quiz details:', error);
+            return null;
+        }
+    }
+    
+    calculateLOScores(questionHistory) {
+        const loScores = {};
+        
+        questionHistory.forEach(history => {
+            const lo_id = history.Question?.lo_id;
+            if (!lo_id) return;
+            
+            if (!loScores[lo_id]) {
+                loScores[lo_id] = {
+                    total_questions: 0,
+                    correct_answers: 0,
+                    total_time: 0
+                };
+            }
+            
+            loScores[lo_id].total_questions++;
+            if (history.is_correct) {
+                loScores[lo_id].correct_answers++;
+            }
+            if (history.time_spent) {
+                loScores[lo_id].total_time += history.time_spent;
+            }
+        });
+        
+        // Convert to percentage scores
+        const scores = {};
+        Object.keys(loScores).forEach(lo_id => {
+            const data = loScores[lo_id];
+            scores[lo_id] = data.total_questions > 0 ? 
+                (data.correct_answers / data.total_questions) * 100 : 0;
+        });
+        
+        return scores;
+    }
+    
+    async updatePLOTracking(user_id, program_id, plo_id, score, transaction) {
+        try {
+            let tracking = await ProgramOutcomeTracking.findOne({
+                where: { user_id, program_id, plo_id, outcome_type: 'PLO', is_active: true },
+                transaction
+            });
+            
+            if (!tracking) {
+                tracking = await ProgramOutcomeTracking.create({
+                    user_id,
+                    program_id,
+                    plo_id,
+                    outcome_type: 'PLO',
+                    current_score: score,
+                    target_score: 70,
+                    achievement_status: score >= 70 ? 'achieved' : 'in_progress',
+                    score_history: [{ date: new Date(), score, source: 'quiz' }],
+                    detailed_analysis: {
+                        contributing_subjects: {},
+                        assessment_breakdown: {},
+                        improvement_trend: 0,
+                        consistency_score: 0
+                    },
+                    predictions: {
+                        predicted_final_score: score,
+                        probability_of_achievement: score >= 70 ? 90 : (score / 70) * 100,
+                        estimated_completion_date: null,
+                        risk_factors: [],
+                        recommended_interventions: []
+                    },
+                    evidence_count: 1,
+                    last_assessment_date: new Date(),
+                    first_assessment_date: new Date()
+                }, { transaction });
+            } else {
+                // Update existing tracking
+                const newScoreHistory = [...(tracking.score_history || []), {
+                    date: new Date(),
+                    score,
+                    source: 'quiz'
+                }];
+                
+                // Calculate weighted average (more recent scores have higher weight)
+                const weights = newScoreHistory.map((_, index) => index + 1);
+                const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+                const weightedScore = newScoreHistory.reduce((sum, entry, index) => 
+                    sum + (entry.score * weights[index]), 0) / totalWeight;
+                
+                await tracking.update({
+                    current_score: weightedScore,
+                    achievement_status: weightedScore >= tracking.target_score ? 'achieved' : 'in_progress',
+                    score_history: newScoreHistory,
+                    evidence_count: tracking.evidence_count + 1,
+                    last_assessment_date: new Date(),
+                    last_updated: new Date()
+                }, { transaction });
+            }
+        } catch (error) {
+            console.error('Error updating PLO tracking:', error);
+            throw error;
+        }
+    }
+    
+    async updatePOTracking(user_id, program_id, po_id, score, transaction) {
+        // Similar logic to PLO tracking but for PO
+        try {
+            let tracking = await ProgramOutcomeTracking.findOne({
+                where: { user_id, program_id, po_id, outcome_type: 'PO', is_active: true },
+                transaction
+            });
+            
+            if (!tracking) {
+                tracking = await ProgramOutcomeTracking.create({
+                    user_id,
+                    program_id,
+                    po_id,
+                    outcome_type: 'PO',
+                    current_score: score,
+                    target_score: 70,
+                    achievement_status: score >= 70 ? 'achieved' : 'in_progress',
+                    score_history: [{ date: new Date(), score, source: 'quiz' }],
+                    evidence_count: 1,
+                    last_assessment_date: new Date(),
+                    first_assessment_date: new Date()
+                }, { transaction });
+            } else {
+                const newScoreHistory = [...(tracking.score_history || []), {
+                    date: new Date(),
+                    score,
+                    source: 'quiz'
+                }];
+                
+                const avgScore = newScoreHistory.reduce((sum, entry) => sum + entry.score, 0) / newScoreHistory.length;
+                
+                await tracking.update({
+                    current_score: avgScore,
+                    achievement_status: avgScore >= tracking.target_score ? 'achieved' : 'in_progress',
+                    score_history: newScoreHistory,
+                    evidence_count: tracking.evidence_count + 1,
+                    last_assessment_date: new Date(),
+                    last_updated: new Date()
+                }, { transaction });
+            }
+        } catch (error) {
+            console.error('Error updating PO tracking:', error);
+            throw error;
+        }
+    }
+    
+    async calculateStudentMetrics(user_id, program_id, transaction) {
+        // Calculate comprehensive student metrics
+        // This is a simplified version - can be expanded
+        
+        const quizResults = await QuizResult.findAll({
+            where: { user_id },
+            include: [{
+                model: Quiz,
+                include: [{
+                    model: Subject,
+                    include: [{
+                        model: Course,
+                        where: { program_id }
+                    }]
+                }]
+            }],
+            transaction
+        });
+        
+        const totalQuizzes = quizResults.length;
+        const avgScore = totalQuizzes > 0 ? 
+            quizResults.reduce((sum, result) => sum + result.score, 0) / totalQuizzes : 0;
+        
+        // Get PO/PLO progress
+        const poProgress = await this.getPOProgress(user_id, program_id, transaction);
+        const ploProgress = await this.getPLOProgress(user_id, program_id, transaction);
+        
+        return {
+            overall_progress: {
+                total_subjects: 0, // Will be calculated properly
+                completed_subjects: 0,
+                in_progress_subjects: 0,
+                completion_percentage: 0,
+                gpa: (avgScore / 100) * 4, // Convert to 4.0 scale
+                credits_earned: 0,
+                total_credits_required: 0
+            },
+            po_progress: poProgress,
+            plo_progress: ploProgress,
+            strengths_weaknesses: {
+                strong_areas: [],
+                weak_areas: [],
+                improvement_suggestions: []
+            },
+            predictions: {
+                graduation_probability: avgScore >= 70 ? 85 : (avgScore / 70) * 85,
+                expected_graduation_date: null,
+                at_risk_subjects: [],
+                recommended_actions: []
+            }
+        };
+    }
+    
+    async getPOProgress(user_id, program_id, transaction) {
+        const poTracking = await ProgramOutcomeTracking.findAll({
+            where: { user_id, program_id, outcome_type: 'PO', is_active: true },
+            transaction
+        });
+        
+        const progress = {};
+        poTracking.forEach(tracking => {
+            progress[tracking.po_id] = {
+                average_score: tracking.current_score,
+                completion_rate: tracking.achievement_status === 'achieved' ? 100 : 
+                    (tracking.current_score / tracking.target_score) * 100
+            };
+        });
+        
+        return progress;
+    }
+    
+    async getPLOProgress(user_id, program_id, transaction) {
+        const ploTracking = await ProgramOutcomeTracking.findAll({
+            where: { user_id, program_id, outcome_type: 'PLO', is_active: true },
+            transaction
+        });
+        
+        const progress = {};
+        ploTracking.forEach(tracking => {
+            progress[tracking.plo_id] = {
+                average_score: tracking.current_score,
+                mastery_level: tracking.current_score >= 90 ? 'excellent' :
+                    tracking.current_score >= 80 ? 'good' :
+                    tracking.current_score >= 70 ? 'satisfactory' : 'needs_improvement'
+            };
+        });
+        
+        return progress;
+    }
+    
+    // =====================================================
+    // BACKGROUND PROCESSING
+    // =====================================================
+    
+    scheduleBackgroundUpdates(program_id, subject_id, user_id) {
+        // This would integrate with a job queue system like Bull/Redis
+        // For now, we'll use setTimeout as a simple example
+        
+        setTimeout(() => {
+            this.updateSubjectAnalytics(program_id, subject_id).catch(console.error);
+        }, 5000); // 5 seconds delay
+        
+        setTimeout(() => {
+            this.updateLearningAnalytics(program_id).catch(console.error);
+        }, 10000); // 10 seconds delay
+    }
+    
+    async updateSubjectAnalytics(program_id, subject_id) {
+        // Update SubjectOutcomeAnalysis table
+        console.log(`Updating subject analytics for subject ${subject_id}`);
+        // Implementation here...
+    }
+    
+    async updateLearningAnalytics(program_id) {
+        // Update LearningAnalytics table
+        console.log(`Updating learning analytics for program ${program_id}`);
+        // Implementation here...
+    }
+}
+
+module.exports = new AnalyticsDataFlowService();

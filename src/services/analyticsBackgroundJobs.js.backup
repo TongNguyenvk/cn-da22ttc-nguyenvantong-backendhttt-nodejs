@@ -1,0 +1,594 @@
+const cron = require('node-cron');
+const {
+    SubjectOutcomeAnalysis,
+    LearningAnalytics,
+    StudentProgramProgress,
+    ProgramOutcomeTracking,
+    QuizResult,
+    UserQuestionHistory,
+    Question,
+    Quiz,
+    Subject,
+    Course,
+    Program,
+    LO,
+    PO,
+    PLO,
+    User,
+    sequelize
+} = require('../models');
+const { Op } = require('sequelize');
+
+class AnalyticsBackgroundJobs {
+    
+    constructor() {
+        this.isRunning = false;
+        this.jobs = [];
+    }
+    
+    // =====================================================
+    // JOB SCHEDULER SETUP
+    // =====================================================
+    
+    startScheduler() {
+        if (this.isRunning) {
+            console.log('📅 Analytics scheduler is already running');
+            return;
+        }
+        
+        console.log('🚀 Starting Analytics Background Jobs Scheduler...');
+        
+        // Daily job at 2 AM - Update Subject Analytics
+        const dailyJob = cron.schedule('0 2 * * *', () => {
+            console.log('🌅 Running daily subject analytics update...');
+            this.updateAllSubjectAnalytics().catch(console.error);
+        }, {
+            scheduled: false,
+            timezone: "Asia/Ho_Chi_Minh"
+        });
+        
+        // Weekly job on Sunday at 3 AM - Generate Learning Analytics
+        const weeklyJob = cron.schedule('0 3 * * 0', () => {
+            console.log('📊 Running weekly learning analytics generation...');
+            this.generateAllLearningAnalytics().catch(console.error);
+        }, {
+            scheduled: false,
+            timezone: "Asia/Ho_Chi_Minh"
+        });
+        
+        // Hourly job - Update Student Progress (for active students)
+        const hourlyJob = cron.schedule('0 * * * *', () => {
+            console.log('⏰ Running hourly student progress update...');
+            this.updateActiveStudentProgress().catch(console.error);
+        }, {
+            scheduled: false,
+            timezone: "Asia/Ho_Chi_Minh"
+        });
+        
+        // Monthly job on 1st at 4 AM - Cleanup old data and refresh materialized views
+        const monthlyJob = cron.schedule('0 4 1 * *', () => {
+            console.log('🧹 Running monthly cleanup and optimization...');
+            this.monthlyCleanupAndOptimization().catch(console.error);
+        }, {
+            scheduled: false,
+            timezone: "Asia/Ho_Chi_Minh"
+        });
+        
+        // Start all jobs
+        dailyJob.start();
+        weeklyJob.start();
+        hourlyJob.start();
+        monthlyJob.start();
+        
+        this.jobs = [dailyJob, weeklyJob, hourlyJob, monthlyJob];
+        this.isRunning = true;
+        
+        console.log('✅ Analytics Background Jobs Scheduler started successfully');
+        console.log('📋 Scheduled jobs:');
+        console.log('  - Daily (2 AM): Subject Analytics Update');
+        console.log('  - Weekly (Sunday 3 AM): Learning Analytics Generation');
+        console.log('  - Hourly: Active Student Progress Update');
+        console.log('  - Monthly (1st 4 AM): Cleanup and Optimization');
+    }
+    
+    stopScheduler() {
+        if (!this.isRunning) {
+            console.log('📅 Analytics scheduler is not running');
+            return;
+        }
+        
+        console.log('🛑 Stopping Analytics Background Jobs Scheduler...');
+        
+        this.jobs.forEach(job => {
+            if (job) {
+                job.stop();
+                job.destroy();
+            }
+        });
+        
+        this.jobs = [];
+        this.isRunning = false;
+        
+        console.log('✅ Analytics Background Jobs Scheduler stopped');
+    }
+    
+    // =====================================================
+    // DAILY JOBS
+    // =====================================================
+    
+    async updateAllSubjectAnalytics() {
+        try {
+            console.log('📚 Starting daily subject analytics update...');
+            
+            // Get all active programs
+            const programs = await Program.findAll({
+                attributes: ['program_id', 'name']
+            });
+            
+            for (const program of programs) {
+                await this.updateSubjectAnalyticsForProgram(program.program_id);
+            }
+            
+            console.log('✅ Daily subject analytics update completed');
+            
+        } catch (error) {
+            console.error('❌ Error in daily subject analytics update:', error);
+        }
+    }
+    
+    async updateSubjectAnalyticsForProgram(program_id) {
+        try {
+            // Get all subjects in the program
+            const subjects = await Subject.findAll({
+                include: [{
+                    model: Course,
+                    where: { program_id },
+                    attributes: ['course_id']
+                }],
+                attributes: ['subject_id', 'name']
+            });
+            
+            const currentSemester = this.getCurrentSemester();
+            const academicYear = this.getCurrentAcademicYear();
+            
+            for (const subject of subjects) {
+                await this.updateSubjectAnalysis(subject.subject_id, program_id, currentSemester, academicYear);
+            }
+            
+        } catch (error) {
+            console.error(`❌ Error updating subject analytics for program ${program_id}:`, error);
+        }
+    }
+    
+    async updateSubjectAnalysis(subject_id, program_id, semester, academic_year) {
+        const transaction = await sequelize.transaction();
+        try {
+            // Check if analysis already exists for this period
+            let analysis = await SubjectOutcomeAnalysis.findOne({
+                where: {
+                    subject_id,
+                    program_id,
+                    analysis_semester: semester,
+                    academic_year
+                },
+                transaction
+            });
+            
+            // Calculate subject statistics
+            const subjectStats = await this.calculateSubjectStatistics(subject_id, program_id, transaction);
+            const poAchievement = await this.calculatePOAchievementForSubject(subject_id, program_id, transaction);
+            const ploAchievement = await this.calculatePLOAchievementForSubject(subject_id, program_id, transaction);
+            const loPerformance = await this.calculateLOPerformanceForSubject(subject_id, transaction);
+            const difficultyAnalysis = await this.calculateDifficultyAnalysisForSubject(subject_id, transaction);
+            
+            const analysisData = {
+                subject_statistics: subjectStats,
+                po_achievement: poAchievement,
+                plo_achievement: ploAchievement,
+                lo_performance: loPerformance,
+                difficulty_analysis: difficultyAnalysis,
+                analysis_date: new Date(),
+                analysis_status: 'completed'
+            };
+            
+            if (analysis) {
+                // Update existing analysis
+                await analysis.update(analysisData, { transaction });
+            } else {
+                // Create new analysis
+                await SubjectOutcomeAnalysis.create({
+                    subject_id,
+                    program_id,
+                    analysis_semester: semester,
+                    academic_year,
+                    ...analysisData
+                }, { transaction });
+            }
+            
+            await transaction.commit();
+            console.log(`✅ Updated subject analysis for subject ${subject_id}`);
+            
+        } catch (error) {
+            await transaction.rollback();
+            console.error(`❌ Error updating subject analysis for subject ${subject_id}:`, error);
+        }
+    }
+    
+    // =====================================================
+    // WEEKLY JOBS
+    // =====================================================
+    
+    async generateAllLearningAnalytics() {
+        try {
+            console.log('📊 Starting weekly learning analytics generation...');
+            
+            const programs = await Program.findAll({
+                attributes: ['program_id', 'name']
+            });
+            
+            for (const program of programs) {
+                await this.generateLearningAnalyticsForProgram(program.program_id);
+            }
+            
+            console.log('✅ Weekly learning analytics generation completed');
+            
+        } catch (error) {
+            console.error('❌ Error in weekly learning analytics generation:', error);
+        }
+    }
+    
+    async generateLearningAnalyticsForProgram(program_id) {
+        const transaction = await sequelize.transaction();
+        try {
+            const timePeriod = {
+                start_date: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000), // Last 7 days
+                end_date: new Date()
+            };
+            
+            // Calculate comprehensive analytics
+            const overviewMetrics = await this.calculateOverviewMetrics(program_id, timePeriod, transaction);
+            const outcomeAnalysis = await this.calculateOutcomeAnalysis(program_id, timePeriod, transaction);
+            const loPerformance = await this.calculateLOPerformance(program_id, timePeriod, transaction);
+            const difficultyDistribution = await this.calculateDifficultyDistribution(program_id, timePeriod, transaction);
+            const studentSegmentation = await this.calculateStudentSegmentation(program_id, timePeriod, transaction);
+            
+            // Create learning analytics record
+            await LearningAnalytics.create({
+                program_id,
+                analysis_type: 'program_overview',
+                time_period: timePeriod,
+                overview_metrics: overviewMetrics,
+                outcome_analysis: outcomeAnalysis,
+                lo_performance: loPerformance,
+                difficulty_distribution: difficultyDistribution,
+                student_segmentation: studentSegmentation,
+                analysis_status: 'completed',
+                created_by: 1, // System user
+                data_snapshot_date: new Date()
+            }, { transaction });
+            
+            await transaction.commit();
+            console.log(`✅ Generated learning analytics for program ${program_id}`);
+            
+        } catch (error) {
+            await transaction.rollback();
+            console.error(`❌ Error generating learning analytics for program ${program_id}:`, error);
+        }
+    }
+    
+    // =====================================================
+    // HOURLY JOBS
+    // =====================================================
+    
+    async updateActiveStudentProgress() {
+        try {
+            console.log('👥 Starting hourly active student progress update...');
+            
+            // Get students who had quiz activity in the last hour
+            const recentActivity = await QuizResult.findAll({
+                where: {
+                    createdAt: {
+                        [Op.gte]: new Date(Date.now() - 60 * 60 * 1000) // Last hour
+                    }
+                },
+                attributes: ['user_id'],
+                include: [{
+                    model: Quiz,
+                    include: [{
+                        model: Subject,
+                        include: [{
+                            model: Course,
+                            attributes: ['program_id']
+                        }]
+                    }]
+                }],
+                group: ['user_id', 'Quiz.Subject.Course.program_id']
+            });
+            
+            const updates = new Map(); // user_id -> Set of program_ids
+            
+            recentActivity.forEach(activity => {
+                const user_id = activity.user_id;
+                const program_id = activity.Quiz?.Subject?.Course?.program_id;
+                
+                if (user_id && program_id) {
+                    if (!updates.has(user_id)) {
+                        updates.set(user_id, new Set());
+                    }
+                    updates.get(user_id).add(program_id);
+                }
+            });
+            
+            // Update progress for each user-program combination
+            for (const [user_id, program_ids] of updates) {
+                for (const program_id of program_ids) {
+                    await this.updateStudentProgressForUser(user_id, program_id);
+                }
+            }
+            
+            console.log(`✅ Updated progress for ${updates.size} active students`);
+            
+        } catch (error) {
+            console.error('❌ Error in hourly student progress update:', error);
+        }
+    }
+    
+    async updateStudentProgressForUser(user_id, program_id) {
+        const transaction = await sequelize.transaction();
+        try {
+            // This would use similar logic to the real-time update
+            // but with more comprehensive calculations
+            
+            let progress = await StudentProgramProgress.findOne({
+                where: { user_id, program_id },
+                transaction
+            });
+            
+            if (!progress) {
+                // Create if doesn't exist
+                progress = await StudentProgramProgress.create({
+                    user_id,
+                    program_id,
+                    overall_progress: {},
+                    po_progress: {},
+                    plo_progress: {},
+                    semester_progress: {},
+                    strengths_weaknesses: { strong_areas: [], weak_areas: [], improvement_suggestions: [] },
+                    predictions: { graduation_probability: 0, expected_graduation_date: null, at_risk_subjects: [], recommended_actions: [] }
+                }, { transaction });
+            }
+            
+            // Calculate updated metrics (simplified for now)
+            const updatedMetrics = await this.calculateComprehensiveStudentMetrics(user_id, program_id, transaction);
+            
+            await progress.update({
+                ...updatedMetrics,
+                last_updated: new Date()
+            }, { transaction });
+            
+            await transaction.commit();
+            
+        } catch (error) {
+            await transaction.rollback();
+            console.error(`❌ Error updating progress for user ${user_id}, program ${program_id}:`, error);
+        }
+    }
+    
+    // =====================================================
+    // MONTHLY JOBS
+    // =====================================================
+    
+    async monthlyCleanupAndOptimization() {
+        try {
+            console.log('🧹 Starting monthly cleanup and optimization...');
+            
+            // 1. Refresh materialized views
+            await this.refreshMaterializedViews();
+            
+            // 2. Archive old analytics data
+            await this.archiveOldAnalyticsData();
+            
+            // 3. Update database statistics
+            await this.updateDatabaseStatistics();
+            
+            // 4. Cleanup temporary data
+            await this.cleanupTemporaryData();
+            
+            console.log('✅ Monthly cleanup and optimization completed');
+            
+        } catch (error) {
+            console.error('❌ Error in monthly cleanup and optimization:', error);
+        }
+    }
+    
+    async refreshMaterializedViews() {
+        try {
+            console.log('🔄 Refreshing materialized views...');
+            
+            await sequelize.query('REFRESH MATERIALIZED VIEW CONCURRENTLY mv_program_statistics');
+            await sequelize.query('REFRESH MATERIALIZED VIEW CONCURRENTLY mv_subject_performance');
+            
+            console.log('✅ Materialized views refreshed');
+        } catch (error) {
+            console.error('❌ Error refreshing materialized views:', error);
+        }
+    }
+    
+    async archiveOldAnalyticsData() {
+        try {
+            console.log('📦 Archiving old analytics data...');
+            
+            const sixMonthsAgo = new Date();
+            sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+            
+            // Archive old LearningAnalytics records
+            await LearningAnalytics.update(
+                { analysis_status: 'archived' },
+                {
+                    where: {
+                        createdAt: { [Op.lt]: sixMonthsAgo },
+                        analysis_status: 'completed'
+                    }
+                }
+            );
+            
+            console.log('✅ Old analytics data archived');
+        } catch (error) {
+            console.error('❌ Error archiving old analytics data:', error);
+        }
+    }
+    
+    async updateDatabaseStatistics() {
+        try {
+            console.log('📊 Updating database statistics...');
+            
+            const tables = [
+                'UserQuestionHistory',
+                'QuizResults',
+                'StudentProgramProgress',
+                'ProgramOutcomeTracking',
+                'SubjectOutcomeAnalysis',
+                'LearningAnalytics'
+            ];
+            
+            for (const table of tables) {
+                await sequelize.query(`ANALYZE "${table}"`);
+            }
+            
+            console.log('✅ Database statistics updated');
+        } catch (error) {
+            console.error('❌ Error updating database statistics:', error);
+        }
+    }
+    
+    async cleanupTemporaryData() {
+        try {
+            console.log('🗑️ Cleaning up temporary data...');
+            
+            // Delete very old temporary analytics records
+            const oneYearAgo = new Date();
+            oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+            
+            await LearningAnalytics.destroy({
+                where: {
+                    createdAt: { [Op.lt]: oneYearAgo },
+                    analysis_status: 'archived'
+                }
+            });
+            
+            console.log('✅ Temporary data cleaned up');
+        } catch (error) {
+            console.error('❌ Error cleaning up temporary data:', error);
+        }
+    }
+    
+    // =====================================================
+    // HELPER FUNCTIONS
+    // =====================================================
+    
+    getCurrentSemester() {
+        const now = new Date();
+        const year = now.getFullYear();
+        const month = now.getMonth() + 1; // JavaScript months are 0-indexed
+        
+        if (month >= 9 || month <= 1) {
+            return `${year}-1`; // Fall semester
+        } else if (month >= 2 && month <= 6) {
+            return `${year}-2`; // Spring semester
+        } else {
+            return `${year}-3`; // Summer semester
+        }
+    }
+    
+    getCurrentAcademicYear() {
+        const now = new Date();
+        const year = now.getFullYear();
+        const month = now.getMonth() + 1;
+        
+        if (month >= 9) {
+            return `${year}-${year + 1}`;
+        } else {
+            return `${year - 1}-${year}`;
+        }
+    }
+    
+    // Placeholder functions for calculations (to be implemented)
+    async calculateSubjectStatistics(subject_id, program_id, transaction) {
+        return {
+            total_students_enrolled: 0,
+            total_students_completed: 0,
+            completion_rate: 0,
+            average_score: 0,
+            pass_rate: 0,
+            dropout_rate: 0
+        };
+    }
+    
+    async calculatePOAchievementForSubject(subject_id, program_id, transaction) {
+        return {};
+    }
+    
+    async calculatePLOAchievementForSubject(subject_id, program_id, transaction) {
+        return {};
+    }
+    
+    async calculateLOPerformanceForSubject(subject_id, transaction) {
+        return {};
+    }
+    
+    async calculateDifficultyAnalysisForSubject(subject_id, transaction) {
+        return {
+            easy: { question_count: 0, average_score: 0, pass_rate: 0 },
+            medium: { question_count: 0, average_score: 0, pass_rate: 0 },
+            hard: { question_count: 0, average_score: 0, pass_rate: 0 }
+        };
+    }
+    
+    async calculateOverviewMetrics(program_id, timePeriod, transaction) {
+        return {
+            total_students: 0,
+            total_assessments: 0,
+            average_performance: 0,
+            completion_rate: 0,
+            engagement_score: 0
+        };
+    }
+    
+    async calculateOutcomeAnalysis(program_id, timePeriod, transaction) {
+        return {};
+    }
+    
+    async calculateLOPerformance(program_id, timePeriod, transaction) {
+        return {};
+    }
+    
+    async calculateDifficultyDistribution(program_id, timePeriod, transaction) {
+        return {
+            easy: { count: 0, avg_score: 0, pass_rate: 0 },
+            medium: { count: 0, avg_score: 0, pass_rate: 0 },
+            hard: { count: 0, avg_score: 0, pass_rate: 0 }
+        };
+    }
+    
+    async calculateStudentSegmentation(program_id, timePeriod, transaction) {
+        return {
+            high_performers: { count: 0, characteristics: [] },
+            average_performers: { count: 0, characteristics: [] },
+            at_risk_students: { count: 0, characteristics: [] },
+            improvement_needed: { count: 0, characteristics: [] }
+        };
+    }
+    
+    async calculateComprehensiveStudentMetrics(user_id, program_id, transaction) {
+        return {
+            overall_progress: {},
+            po_progress: {},
+            plo_progress: {},
+            semester_progress: {},
+            strengths_weaknesses: { strong_areas: [], weak_areas: [], improvement_suggestions: [] },
+            predictions: { graduation_probability: 0, expected_graduation_date: null, at_risk_subjects: [], recommended_actions: [] }
+        };
+    }
+}
+
+module.exports = new AnalyticsBackgroundJobs();

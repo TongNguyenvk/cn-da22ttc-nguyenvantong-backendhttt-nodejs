@@ -1,0 +1,18 @@
+# Quick Docker Rebuild Guide
+
+## Stop and rebuild
+docker-compose down
+docker-compose build backend
+docker-compose up -d
+
+## Or one command
+docker-compose up -d --build backend
+
+## Check logs
+docker-compose logs -f backend
+
+## Test
+curl -X POST http://localhost:8888/api/questions/import-from-zip \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -F "zip_file=@backend/sample_data/sample_questions_package.zip" \
+  -F "subject_id=1"

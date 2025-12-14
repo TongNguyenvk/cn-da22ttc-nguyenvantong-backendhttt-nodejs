@@ -1,0 +1,3584 @@
+const {
+    QuizResult,
+    UserQuestionHistory,
+    Question,
+    Quiz,
+    Subject,
+    User,
+    LO,
+    Level,
+    Chapter,
+    ChapterLO,
+    ChapterSection,
+    Answer,
+    Course,
+    Program,
+    QuizQuestion
+} = require('../models');
+const { Op, Sequelize } = require('sequelize');
+// Optional import for practice recommendation logic
+let practiceRecommendationInternal = null;
+try {
+    practiceRecommendationInternal = require('./practiceRecommendationController');
+} catch (e) {
+    // ignore if not present
+}
+
+/**
+ * TEACHER ANALYTICS CONTROLLER
+ * Chuyên cung cấp các API analytics chi tiết cho giảng viên
+ */
+
+// ==================== HELPER FUNCTIONS ====================
+
+/**
+ * Tính toán phân tích điểm mạnh/yếu theo LO
+ */
+const analyzeLOPerformance = (questions, questionHistory) => {
+    const loStats = {};
+
+    questions.forEach(question => {
+        const loId = question.lo_id;
+        const loName = question.LO?.name || 'Unknown LO';
+
+        if (!loStats[loId]) {
+            loStats[loId] = {
+                lo_id: loId,
+                lo_name: loName,
+                total_questions: 0,
+                total_attempts: 0,
+                correct_attempts: 0,
+                total_time: 0,
+                students_attempted: new Set()
+            };
+        }
+
+        const questionAttempts = questionHistory.filter(h => h.question_id === question.question_id);
+
+        // Nhóm theo user_id để lấy attempt ĐẦU TIÊN của mỗi học sinh (bỏ qua retry)
+        const userFirstAttempts = {};
+        questionAttempts.forEach(attempt => {
+            const userId = attempt.user_id;
+            if (!userFirstAttempts[userId] || new Date(attempt.created_at) < new Date(userFirstAttempts[userId].created_at)) {
+                userFirstAttempts[userId] = attempt;
+            }
+        });
+
+        // Chỉ đếm attempt ĐẦU TIÊN của mỗi học sinh
+        const firstAttempts = Object.values(userFirstAttempts);
+
+        loStats[loId].total_questions++;
+        loStats[loId].total_attempts += firstAttempts.length;
+        loStats[loId].correct_attempts += firstAttempts.filter(h => h.is_correct).length;
+        loStats[loId].total_time += firstAttempts.reduce((sum, h) => sum + (h.time_spent || 0), 0);
+
+        firstAttempts.forEach(h => loStats[loId].students_attempted.add(h.user_id));
+    });
+
+    // Tính toán metrics và phân loại
+    const loAnalysis = Object.values(loStats).map(lo => {
+        const accuracy = lo.total_attempts > 0 ? (lo.correct_attempts / lo.total_attempts) * 100 : 0;
+        const avgTime = lo.total_attempts > 0 ? lo.total_time / lo.total_attempts : 0;
+        const studentCount = lo.students_attempted.size;
+
+        let performance_level = 'good';
+        let insights = [];
+        let recommendations = [];
+
+        if (accuracy < 50) {
+            performance_level = 'weak';
+            insights.push(`Tỷ lệ đúng thấp (${accuracy.toFixed(1)}%) - cần cải thiện`);
+            recommendations.push('Cần bổ sung thêm bài giảng và bài tập cho LO này');
+            recommendations.push('Xem xét điều chỉnh phương pháp giảng dạy');
+        } else if (accuracy < 70) {
+            performance_level = 'average';
+            insights.push(`Tỷ lệ đúng trung bình (${accuracy.toFixed(1)}%) - có thể cải thiện`);
+            recommendations.push('Tăng cường luyện tập thêm cho LO này');
+        } else {
+            insights.push(`Tỷ lệ đúng tốt (${accuracy.toFixed(1)}%)`);
+            recommendations.push('Duy trì phương pháp giảng dạy hiện tại');
+        }
+
+        if (avgTime > 120) { // > 2 phút
+            insights.push('Thời gian trả lời cao - có thể câu hỏi khó hoặc chưa hiểu rõ');
+            recommendations.push('Xem xét đơn giản hóa câu hỏi hoặc bổ sung giải thích');
+        }
+
+        return {
+            ...lo,
+            students_attempted: studentCount,
+            accuracy: parseFloat(accuracy.toFixed(2)),
+            average_time: parseFloat(avgTime.toFixed(2)),
+            performance_level,
+            insights,
+            recommendations
+        };
+    });
+
+    // Sắp xếp theo độ yếu (accuracy thấp nhất trước)
+    return loAnalysis.sort((a, b) => a.accuracy - b.accuracy);
+};
+
+/**
+ * GET /api/teacher-analytics/quiz/:quizId/retest-recommendation?user_id=&target_questions=&course_id=
+ * Xây dựng blueprint cho Test 2 dựa trên Test 1 (quizId) và lịch sử luyện tập của sinh viên.
+ * Mục tiêu: tập trung điểm yếu, xác minh cải thiện, duy trì kiến thức mạnh.
+ */
+const getRetestRecommendation = async (req, res) => {
+    try {
+        const { quizId } = req.params;
+        const { user_id, target_questions = 15, course_id } = req.query;
+        if (!user_id) return res.status(400).json({ success: false, message: 'Thiếu user_id' });
+        if (!['admin', 'teacher'].includes(req.roleName) && parseInt(user_id) !== req.userId) {
+            return res.status(403).json({ success: false, message: 'Không có quyền' });
+        }
+        const quiz = await Quiz.findByPk(quizId, {
+            include: [
+                { model: Question, as: 'Questions', through: { attributes: [] }, attributes: ['question_id', 'lo_id', 'level_id'] },
+                { model: Course, as: 'Course', attributes: ['course_id', 'name', 'subject_id'] }
+            ]
+        });
+        if (!quiz) return res.status(404).json({ success: false, message: 'Quiz không tồn tại' });
+        const effectiveCourseId = course_id || quiz.course_id;
+
+        // Baseline history (Test 1)
+        const baselineHistory = await UserQuestionHistory.findAll({
+            where: { quiz_id: quizId, user_id },
+            include: [{ model: Question, as: 'Question', attributes: ['question_id', 'lo_id', 'level_id'] }]
+        });
+        // Practice after quiz (quiz_id null & attempt after end_time if available)
+        const practiceWhere = { user_id, quiz_id: null };
+        if (quiz.end_time) practiceWhere.attempt_date = { [Op.gt]: quiz.end_time };
+        const practiceHistory = await UserQuestionHistory.findAll({
+            where: practiceWhere,
+            include: [{ model: Question, as: 'Question', attributes: ['question_id', 'lo_id', 'level_id'] }]
+        });
+
+        const levelNameById = { 1: 'easy', 2: 'medium', 3: 'hard' };
+        const baselineStats = {};
+        baselineHistory.forEach(h => { if (!h.Question) return; const k = `${h.Question.lo_id}:${h.Question.level_id}`; if (!baselineStats[k]) baselineStats[k] = { lo_id: h.Question.lo_id, level_id: h.Question.level_id, attempts: 0, correct: 0 }; baselineStats[k].attempts++; if (h.is_correct) baselineStats[k].correct++; });
+        const practiceStats = {};
+        practiceHistory.forEach(h => { if (!h.Question) return; const k = `${h.Question.lo_id}:${h.Question.level_id}`; if (!practiceStats[k]) practiceStats[k] = { attempts: 0, correct: 0 }; practiceStats[k].attempts++; if (h.is_correct) practiceStats[k].correct++; });
+
+        // Priorities from practice module
+        let priorities = [];
+        if (practiceRecommendationInternal && practiceRecommendationInternal.getPracticeRecommendationsInternal) {
+            // Use course-based recommendations (subject_id migration)
+            priorities = await practiceRecommendationInternal.getPracticeRecommendationsInternal(effectiveCourseId, user_id);
+        }
+        const priorityMap = {}; priorities.forEach(p => { priorityMap[`${p.lo_id}:${p.difficulty}`] = p.priority; });
+
+        const allKeys = new Set([...Object.keys(baselineStats), ...Object.keys(practiceStats)]);
+        const detailed = [];
+        allKeys.forEach(k => {
+            const [lo_id, level_id] = k.split(':').map(Number);
+            const base = baselineStats[k] || { attempts: 0, correct: 0 };
+            const prac = practiceStats[k] || { attempts: 0, correct: 0 };
+            const bAcc = base.attempts ? (base.correct / base.attempts) * 100 : 0;
+            const pAcc = prac.attempts ? (prac.correct / prac.attempts) * 100 : 0;
+            const delta = pAcc - bAcc;
+            const difficulty = levelNameById[level_id] || 'unknown';
+            let status = 'no_change'; if (delta > 5) status = 'improved'; else if (delta < -5) status = 'regressed';
+            const priority = priorityMap[`${lo_id}:${difficulty}`] || (bAcc < 50 ? 'urgent' : bAcc < 70 ? 'high' : bAcc < 85 ? 'medium' : 'low');
+            let include = false; let include_reason = '';
+            if (priority === 'urgent' || priority === 'high') { include = true; include_reason = 'Weakness focus'; }
+            else if (status === 'improved' && bAcc < 70) { include = true; include_reason = 'Verify improvement'; }
+            else if (bAcc >= 85 && difficulty !== 'hard') { include = true; include_reason = 'Retention & escalate difficulty'; }
+            detailed.push({ lo_id, level_id, difficulty, baseline_accuracy: parseFloat(bAcc.toFixed(2)), practice_accuracy: parseFloat(pAcc.toFixed(2)), delta: parseFloat(delta.toFixed(2)), status, priority, include, include_reason });
+        });
+
+        const totalTarget = parseInt(target_questions) || 15;
+        const focusWeak = detailed.filter(d => d.include_reason === 'Weakness focus').sort((a,b)=>a.baseline_accuracy-b.baseline_accuracy);
+        const verifyImprove = detailed.filter(d => d.include_reason === 'Verify improvement').sort((a,b)=>a.delta-b.delta);
+        const retention = detailed.filter(d => d.include_reason && d.include_reason.startsWith('Retention')).sort((a,b)=>b.baseline_accuracy-a.baseline_accuracy);
+        let allocWeak = Math.round(totalTarget * 0.5);
+        let allocImprove = Math.round(totalTarget * 0.3);
+        let allocRetention = totalTarget - allocWeak - allocImprove; if (allocRetention < 0) allocRetention = 0;
+        const baselineQuestionIds = quiz.Questions.map(q=>q.question_id);
+        const picked = []; const composition = { easy:0, medium:0, hard:0 };
+        async function pick(list, slots, tag){
+            if (slots <= 0 || list.length === 0) return 0;
+            
+            // Lấy tất cả questions cần thiết trong một query duy nhất
+            const loIds = [...new Set(list.map(item => item.lo_id))];
+            const levelIds = [...new Set(list.map(item => item.level_id))];
+            const excludedIds = picked.map(p => p.question_id).concat(baselineQuestionIds);
+            
+            const allCandidates = await Question.findAll({
+                where: {
+                    lo_id: { [Op.in]: loIds },
+                    level_id: { [Op.in]: levelIds },
+                    question_id: { [Op.notIn]: excludedIds }
+                },
+                attributes: ['question_id', 'lo_id', 'level_id'],
+                limit: 100 // Giới hạn để tránh quá tải
+            });
+
+            // Group candidates theo lo_id và level_id
+            const candidateMap = {};
+            allCandidates.forEach(q => {
+                const key = `${q.lo_id}_${q.level_id}`;
+                if (!candidateMap[key]) candidateMap[key] = [];
+                candidateMap[key].push(q);
+            });
+
+            for(const item of list) {
+                if(slots <= 0) break;
+                
+                const key = `${item.lo_id}_${item.level_id}`;
+                const candidates = candidateMap[key] || [];
+                
+                if (!candidates.length) continue;
+                
+                const take = Math.min(slots, Math.max(1, Math.ceil(candidates.length/4)));
+                
+                for(let i = 0; i < take && i < candidates.length; i++) {
+                    const q = candidates[i];
+                    picked.push({
+                        question_id: q.question_id,
+                        lo_id: q.lo_id,
+                        difficulty: item.difficulty,
+                        source: tag
+                    });
+                    composition[item.difficulty]++;
+                }
+                slots -= take;
+            }
+            return slots;
+        }
+        let r1 = await pick(focusWeak, allocWeak, 'weak');
+        let r2 = await pick(verifyImprove, allocImprove, 'improve');
+        let r3 = await pick(retention, allocRetention, 'retention');
+        let remaining = r1 + r2 + r3;
+        if (remaining > 0) { // fill from any included
+            await pick(detailed.filter(d=>d.include), remaining, 'fill');
+        }
+        if (picked.length > totalTarget) picked.splice(totalTarget);
+        const loDist = {}; picked.forEach(p=>{ loDist[p.lo_id]=(loDist[p.lo_id]||0)+1; });
+        const recs = [];
+        if (focusWeak.length) recs.push('50% câu hỏi nhắm vào LO yếu ưu tiên urgent/high.');
+        if (verifyImprove.length) recs.push('30% câu hỏi xác minh cải thiện sau luyện tập.');
+        if (retention.length) recs.push('20% câu hỏi duy trì, nâng độ khó kiến thức vững.');
+        recs.push('Sau Test 2: so sánh delta accuracy per LO (>5% coi là cải thiện).');
+        return res.json({ success:true, data:{ baseline_quiz_id: parseInt(quizId), course_id: effectiveCourseId, user_id: parseInt(user_id), target_total_questions: totalTarget, allocation:{ focus_weak: allocWeak, improvement_followup: allocImprove, retention_check: allocRetention }, lo_difficulty_analysis: detailed, blueprint:{ questions:picked, composition, lo_distribution:Object.entries(loDist).map(([lo_id,count])=>({ lo_id:parseInt(lo_id), count })) }, recommendations: recs, evaluation_method:{ metrics:['overall_accuracy_delta','weak_lo_accuracy_delta','hard_question_accuracy'], rule:'Delta >5% improvement, <-5% regression.' }, generated_at: new Date() } });
+    } catch (error) {
+        console.error('Error getRetestRecommendation:', error); return res.status(500).json({ success:false, message:'Lỗi tạo đề xuất Test 2', error:error.message });
+    }
+};
+
+/**
+ * GET /api/teacher-analytics/retest-improvement?baseline_quiz_id=&retest_quiz_id=&user_id=
+ * So sánh kết quả Test 1 và Test 2 để đánh giá cải thiện theo LO.
+ */
+const getRetestImprovement = async (req, res) => {
+    try {
+        const { baseline_quiz_id, retest_quiz_id, user_id } = req.query;
+        if (!baseline_quiz_id || !retest_quiz_id || !user_id) return res.status(400).json({ success:false, message:'Thiếu baseline_quiz_id|retest_quiz_id|user_id' });
+        if (!['admin','teacher'].includes(req.roleName) && parseInt(user_id)!==req.userId) return res.status(403).json({ success:false, message:'Không có quyền' });
+        const [baseHist, reHist] = await Promise.all([
+            UserQuestionHistory.findAll({ where:{ quiz_id: baseline_quiz_id, user_id }, include:[{ model: Question, as:'Question', attributes:['question_id','lo_id','level_id'] }] }),
+            UserQuestionHistory.findAll({ where:{ quiz_id: retest_quiz_id, user_id }, include:[{ model: Question, as:'Question', attributes:['question_id','lo_id','level_id'] }] })
+        ]);
+        if (!baseHist.length || !reHist.length) return res.status(404).json({ success:false, message:'Không đủ dữ liệu để so sánh' });
+        const agg = (rows)=>{ const map={}; rows.forEach(h=>{ if(!h.Question) return; const k=h.Question.lo_id; if(!map[k]) map[k]={ attempts:0, correct:0 }; map[k].attempts++; if(h.is_correct) map[k].correct++; }); return map; };
+        const m1=agg(baseHist), m2=agg(reHist); const all=new Set([...Object.keys(m1),...Object.keys(m2)]); const lo_comparison=[];
+        all.forEach(lo_id=>{ const b=m1[lo_id]||{attempts:0,correct:0}; const r=m2[lo_id]||{attempts:0,correct:0}; const bAcc=b.attempts?(b.correct/b.attempts)*100:0; const rAcc=r.attempts?(r.correct/r.attempts)*100:0; const delta=rAcc-bAcc; let status='no_change'; if(delta>5) status='improved'; else if(delta<-5) status='regressed'; lo_comparison.push({ lo_id:parseInt(lo_id), baseline_accuracy:parseFloat(bAcc.toFixed(2)), retest_accuracy:parseFloat(rAcc.toFixed(2)), delta:parseFloat(delta.toFixed(2)), status }); });
+        const overallBaseline = baseHist.filter(h=>h.is_correct).length / baseHist.length * 100;
+        const overallRetest = reHist.filter(h=>h.is_correct).length / reHist.length * 100;
+        const overallDelta = overallRetest - overallBaseline;
+        return res.json({ success:true, data:{ user_id:parseInt(user_id), baseline_quiz_id:parseInt(baseline_quiz_id), retest_quiz_id:parseInt(retest_quiz_id), overall:{ baseline_accuracy:parseFloat(overallBaseline.toFixed(2)), retest_accuracy:parseFloat(overallRetest.toFixed(2)), delta:parseFloat(overallDelta.toFixed(2)), status: overallDelta>5?'improved': overallDelta<-5?'regressed':'no_change' }, lo_comparison, generated_at:new Date() } });
+    } catch (error) { console.error('Error getRetestImprovement:', error); return res.status(500).json({ success:false, message:'Lỗi so sánh cải thiện', error:error.message }); }
+};
+// ==================== LEVEL PERFORMANCE ANALYSIS ====================
+/**
+ * Tính toán phân tích điểm mạnh/yếu theo Level
+ */
+const analyzeLevelPerformance = (questions, questionHistory) => {
+    const levelStats = {};
+
+    questions.forEach(question => {
+        const levelId = question.level_id;
+        const levelName = question.Level?.name || 'Unknown Level';
+
+        if (!levelStats[levelId]) {
+            levelStats[levelId] = {
+                level_id: levelId,
+                level_name: levelName,
+                total_questions: 0,
+                total_attempts: 0,
+                correct_attempts: 0,
+                total_time: 0,
+                students_attempted: new Set()
+            };
+        }
+
+        const questionAttempts = questionHistory.filter(h => h.question_id === question.question_id);
+        // Chỉ tính attempt ĐẦU TIÊN của mỗi học sinh cho câu hỏi này
+        const firstByUser = {};
+        questionAttempts.forEach(attempt => {
+            const key = attempt.user_id;
+            const t = new Date(attempt.created_at || attempt.attempt_date);
+            const cur = firstByUser[key];
+            if (!cur || t < new Date(cur.created_at || cur.attempt_date)) {
+                firstByUser[key] = attempt;
+            }
+        });
+        const firstAttempts = Object.values(firstByUser);
+
+        levelStats[levelId].total_questions++;
+        levelStats[levelId].total_attempts += firstAttempts.length;
+        levelStats[levelId].correct_attempts += firstAttempts.filter(h => h.is_correct).length;
+        levelStats[levelId].total_time += firstAttempts.reduce((sum, h) => sum + (h.time_spent || 0), 0);
+
+        firstAttempts.forEach(h => levelStats[levelId].students_attempted.add(h.user_id));
+    });
+
+    const levelAnalysis = Object.values(levelStats).map(level => {
+        const accuracy = level.total_attempts > 0 ? (level.correct_attempts / level.total_attempts) * 100 : 0;
+        const avgTime = level.total_attempts > 0 ? level.total_time / level.total_attempts : 0;
+        const studentCount = level.students_attempted.size;
+
+        let performance_level = 'good';
+        let insights = [];
+        let recommendations = [];
+
+        // Phân tích dựa trên level
+        if (level.level_name.toLowerCase().includes('easy') || level.level_name.toLowerCase().includes('dễ')) {
+            if (accuracy < 80) {
+                performance_level = 'weak';
+                insights.push(`Câu hỏi dễ nhưng tỷ lệ đúng thấp (${accuracy.toFixed(1)}%) - cần xem xét kiến thức cơ bản`);
+                recommendations.push('Cần củng cố kiến thức nền tảng');
+            }
+        } else if (level.level_name.toLowerCase().includes('hard') || level.level_name.toLowerCase().includes('khó')) {
+            if (accuracy < 40) {
+                performance_level = 'weak';
+                insights.push(`Câu hỏi khó với tỷ lệ đúng rất thấp (${accuracy.toFixed(1)}%)`);
+                recommendations.push('Cần bổ sung thêm ví dụ và bài tập nâng cao');
+            } else if (accuracy > 70) {
+                insights.push(`Học sinh làm tốt câu hỏi khó (${accuracy.toFixed(1)}%)`);
+                recommendations.push('Có thể tăng độ khó hoặc thêm câu hỏi thách thức');
+            }
+        }
+
+        return {
+            ...level,
+            students_attempted: studentCount,
+            accuracy: parseFloat(accuracy.toFixed(2)),
+            average_time: parseFloat(avgTime.toFixed(2)),
+            performance_level,
+            insights,
+            recommendations
+        };
+    });
+
+    return levelAnalysis.sort((a, b) => a.accuracy - b.accuracy);
+};
+
+/**
+ * Phân nhóm học sinh theo performance
+ */
+const categorizeStudentsByPerformance = (quizResults, questionHistory, totalQuizQuestions) => {
+    const studentGroups = {
+        excellent: { threshold: 9.0, students: [], insights: [] },
+        good: { threshold: 8.0, students: [], insights: [] },
+        average: { threshold: 7.5, students: [], insights: [] },
+        medium: { threshold: 6.0, students: [], insights: [] },
+        weak: { threshold: 4.0, students: [], insights: [] }
+    };
+
+    quizResults.forEach(result => {
+        const allStudentHistory = questionHistory.filter(h => h.user_id === result.user_id);
+
+        // Nhóm theo question_id để lấy attempt ĐẦU TIÊN của mỗi câu hỏi (bỏ qua retry)
+        const questionAttempts = {};
+        allStudentHistory.forEach(attempt => {
+            const questionId = attempt.question_id;
+            if (!questionAttempts[questionId] || new Date(attempt.created_at) < new Date(questionAttempts[questionId].created_at)) {
+                questionAttempts[questionId] = attempt;
+            }
+        });
+
+        // Chỉ sử dụng attempt ĐẦU TIÊN của mỗi câu hỏi
+        const studentHistory = Object.values(questionAttempts);
+        const avgTime = studentHistory.length > 0 ?
+            studentHistory.reduce((sum, h) => sum + (h.time_spent || 0), 0) / studentHistory.length : 0;
+
+        // FIX: Lấy điểm từ QuizResults (đã có điểm chính xác) thay vì tính lại
+        // QuizResults.score đã được tính với logic đúng (có penalty cho retry)
+        const scoreFromDB = parseFloat(result.score || 0);
+        const correctAnswers = studentHistory.filter(h => h.is_correct).length;
+        const totalQuestions = Math.max(0, parseInt(totalQuizQuestions || 0, 10));
+        
+        // Sử dụng điểm từ DB để phân nhóm (đã normalize về thang 10)
+        const scoreForGrouping = scoreFromDB;
+        const percentageScore = totalQuestions > 0 ? (scoreFromDB / 10) * 100 : 0;
+
+        const studentData = {
+            user_id: result.user_id,
+            name: result.Student?.name || 'Unknown',
+            email: result.Student?.email || '',
+            score: parseFloat(scoreFromDB.toFixed(2)), // FIX: Dùng điểm từ QuizResults
+            percentage_score: parseFloat(percentageScore.toFixed(2)),
+            completion_time: result.completion_time,
+            average_time_per_question: parseFloat(avgTime.toFixed(2)),
+            total_questions_attempted: studentHistory.length,
+            correct_answers: correctAnswers
+        };
+
+        if (scoreForGrouping >= 9.0) {
+            studentGroups.excellent.students.push(studentData);
+        } else if (scoreForGrouping >= 8.0) {
+            studentGroups.good.students.push(studentData);
+        } else if (scoreForGrouping >= 7.5) {
+            studentGroups.average.students.push(studentData);
+        } else if (scoreForGrouping >= 6.0) {
+            studentGroups.medium.students.push(studentData);
+        } else if (scoreForGrouping >= 4.0) {
+            studentGroups.weak.students.push(studentData);
+        } else {
+            // Học sinh dưới 4 điểm - có thể thêm nhóm "rất yếu" nếu cần
+            studentGroups.weak.students.push(studentData);
+        }
+    });
+
+    // Thêm insights cho từng nhóm
+    studentGroups.excellent.insights = [
+        'Nhóm học sinh xuất sắc (trên 9 điểm), có thể làm mentor cho nhóm khác',
+        'Cân nhắc đưa ra thêm thách thức nâng cao'
+    ];
+
+    studentGroups.good.insights = [
+        'Nhóm học sinh giỏi (8-9 điểm), cần duy trì và phát triển thêm',
+        'Có thể hướng dẫn thêm để đạt mức xuất sắc'
+    ];
+
+    studentGroups.average.insights = [
+        'Nhóm học sinh khá (7.5-8 điểm), cần hỗ trợ thêm để cải thiện',
+        'Tập trung vào các điểm yếu cụ thể'
+    ];
+
+    studentGroups.medium.insights = [
+        'Nhóm học sinh trung bình (6-7.5 điểm), cần hỗ trợ thêm',
+        'Tập trung vào các điểm yếu cụ thể'
+    ];
+
+    studentGroups.weak.insights = [
+        'Nhóm học sinh yếu (4-6 điểm), cần sự quan tâm đặc biệt',
+        'Cần kế hoạch hỗ trợ cá nhân hóa',
+        'Xem xét phương pháp giảng dạy phù hợp hơn'
+    ];
+
+    return studentGroups;
+};
+
+/**
+ * Tạo insights tổng thể cho giảng viên
+ */
+const generateTeacherInsights = (quizData, loAnalysis, levelAnalysis, studentGroups) => {
+    const insights = [];
+    const recommendations = [];
+
+    // Phân tích tổng thể
+    const totalStudents = quizData.participant_stats.total_participants;
+    const avgScore = quizData.participant_stats.average_score;
+    const completionRate = quizData.participant_stats.completion_rate;
+
+    // Insights về tổng thể
+    if (avgScore < 50) {
+        insights.push({
+            type: 'warning',
+            category: 'overall_performance',
+            message: `Điểm trung bình thấp (${avgScore.toFixed(1)}/100) - cần xem xét lại phương pháp giảng dạy`,
+            priority: 'high'
+        });
+        recommendations.push({
+            category: 'teaching_method',
+            suggestion: 'Cần điều chỉnh phương pháp giảng dạy và bổ sung thêm tài liệu',
+            priority: 'high'
+        });
+    } else if (avgScore > 85) {
+        insights.push({
+            type: 'success',
+            category: 'overall_performance',
+            message: `Điểm trung bình cao (${avgScore.toFixed(1)}/100) - học sinh nắm vững kiến thức`,
+            priority: 'medium'
+        });
+        recommendations.push({
+            category: 'challenge',
+            suggestion: 'Có thể tăng độ khó hoặc thêm câu hỏi nâng cao',
+            priority: 'medium'
+        });
+    }
+
+    // Insights về completion rate
+    if (completionRate < 80) {
+        insights.push({
+            type: 'warning',
+            category: 'engagement',
+            message: `Tỷ lệ hoàn thành thấp (${completionRate.toFixed(1)}%) - cần tăng cường động lực học tập`,
+            priority: 'high'
+        });
+        recommendations.push({
+            category: 'engagement',
+            suggestion: 'Xem xét giảm thời gian quiz hoặc tăng tính tương tác',
+            priority: 'high'
+        });
+    }
+
+    // Insights về phân nhóm học sinh
+    const weakStudentCount = studentGroups.weak.students.length;
+    const excellentStudentCount = studentGroups.excellent.students.length;
+
+    if (weakStudentCount > totalStudents * 0.3) {
+        insights.push({
+            type: 'warning',
+            category: 'student_distribution',
+            message: `Có ${weakStudentCount} học sinh yếu (${((weakStudentCount / totalStudents) * 100).toFixed(1)}%) - cần hỗ trợ đặc biệt`,
+            priority: 'high'
+        });
+        recommendations.push({
+            category: 'support',
+            suggestion: 'Tổ chức lớp phụ đạo hoặc hỗ trợ cá nhân cho nhóm học sinh yếu',
+            priority: 'high'
+        });
+    }
+
+    if (excellentStudentCount > totalStudents * 0.4) {
+        insights.push({
+            type: 'success',
+            category: 'student_distribution',
+            message: `Có ${excellentStudentCount} học sinh xuất sắc (${((excellentStudentCount / totalStudents) * 100).toFixed(1)}%) - kết quả tốt`,
+            priority: 'low'
+        });
+        recommendations.push({
+            category: 'advanced',
+            suggestion: 'Tận dụng nhóm học sinh giỏi để hỗ trợ nhóm yếu hơn',
+            priority: 'medium'
+        });
+    }
+
+    // Insights về LO yếu nhất
+    const weakestLO = loAnalysis.find(lo => lo.performance_level === 'weak');
+    if (weakestLO) {
+        insights.push({
+            type: 'warning',
+            category: 'learning_outcome',
+            message: `LO "${weakestLO.lo_name}" có hiệu suất thấp nhất (${weakestLO.accuracy}%)`,
+            priority: 'high'
+        });
+        recommendations.push({
+            category: 'curriculum',
+            suggestion: `Cần tăng cường giảng dạy cho LO "${weakestLO.lo_name}"`,
+            priority: 'high'
+        });
+    }
+
+    return { insights, recommendations };
+};
+
+// ==================== API ENDPOINTS ====================
+
+/**
+ * API: Lấy báo cáo tổng quan quiz nâng cao cho giảng viên
+ * GET /api/teacher-analytics/quiz/:quizId/comprehensive-report
+ */
+const getComprehensiveQuizReport = async (req, res) => {
+    try {
+        const quizId = req.params.quizId;
+
+        // Kiểm tra quyền truy cập
+        if (!['admin', 'teacher'].includes(req.roleName)) {
+            return res.status(403).json({ error: 'Không có quyền truy cập' });
+        }
+
+        // Lấy thông tin quiz với đầy đủ relations
+        const quiz = await Quiz.findByPk(quizId, {
+            include: [
+                {
+                    model: Question,
+                    as: 'Questions',
+                    through: { attributes: [] },
+                    attributes: ['question_id', 'question_text', 'level_id', 'lo_id'],
+                    include: [
+                        {
+                            model: Level,
+                            as: 'Level',
+                            attributes: ['level_id', 'name']
+                        },
+                        {
+                            model: LO,
+                            as: 'LO',
+                            attributes: ['lo_id', 'name', 'description']
+                        }
+                    ]
+                },
+                {
+                    model: Course,
+                    as: 'Course',
+                    attributes: ['course_id', 'name', 'subject_id'],
+                    include: [
+                        {
+                            model: Subject,
+                            as: 'Subject',
+                            attributes: ['subject_id', 'name', 'description']
+                        }
+                    ]
+                }
+            ]
+        });
+
+        if (!quiz) {
+            return res.status(404).json({ error: 'Không tìm thấy quiz' });
+        }
+
+        // Lấy kết quả quiz
+        const quizResults = await QuizResult.findAll({
+            where: { quiz_id: quizId },
+            include: [
+                {
+                    model: User,
+                    as: 'Student',
+                    attributes: ['user_id', 'name', 'email']
+                }
+            ]
+        });
+
+        // Lấy lịch sử trả lời câu hỏi
+        const questionHistory = await UserQuestionHistory.findAll({
+            where: { quiz_id: quizId },
+            include: [
+                {
+                    model: User,
+                    as: 'User',
+                    attributes: ['user_id', 'name', 'email']
+                },
+                {
+                    model: Question,
+                    as: 'Question',
+                    attributes: ['question_id', 'question_text', 'level_id', 'lo_id']
+                }
+            ]
+        });
+
+        // Tính toán thống kê cơ bản
+        const totalParticipants = quizResults.length;
+        const completedParticipants = quizResults.filter(r => r.status === 'completed').length;
+        const averageScore = totalParticipants > 0 ?
+            quizResults.reduce((acc, curr) => acc + curr.score, 0) / totalParticipants : 0;
+        const highestScore = totalParticipants > 0 ? Math.max(...quizResults.map(r => r.score)) : 0;
+        const lowestScore = totalParticipants > 0 ? Math.min(...quizResults.map(r => r.score)) : 0;
+
+        const basicStats = {
+            quiz_info: {
+                quiz_id: quiz.quiz_id,
+                name: quiz.name,
+                course_name: quiz.Course?.name || 'Unknown Course',
+                subject_name: quiz.Course?.Subject?.name || 'Unknown Subject',
+                total_questions: quiz.Questions.length,
+                duration: quiz.duration,
+                status: quiz.status
+            },
+            participant_stats: {
+                total_participants: totalParticipants,
+                completed_participants: completedParticipants,
+                completion_rate: totalParticipants > 0 ? (completedParticipants / totalParticipants) * 100 : 0,
+                average_score: parseFloat(averageScore.toFixed(2)),
+                highest_score: highestScore,
+                lowest_score: lowestScore
+            }
+        };
+
+        // Phân tích chi tiết
+    const loAnalysis = analyzeLOPerformance(quiz.Questions, questionHistory);
+    const levelAnalysis = analyzeLevelPerformance(quiz.Questions, questionHistory);
+    const studentGroups = categorizeStudentsByPerformance(quizResults, questionHistory, quiz.Questions.length);
+        const teacherInsights = generateTeacherInsights(basicStats, loAnalysis, levelAnalysis, studentGroups);
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                ...basicStats,
+                learning_outcome_analysis: loAnalysis,
+                difficulty_level_analysis: levelAnalysis,
+                student_performance_groups: studentGroups,
+                teacher_insights: teacherInsights,
+                generated_at: new Date()
+            }
+        });
+
+    } catch (error) {
+        console.error('Error in getComprehensiveQuizReport:', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Lỗi khi tạo báo cáo tổng quan',
+            details: error.message
+        });
+    }
+};
+
+/**
+ * API: Lấy phân tích chi tiết theo nhóm học sinh
+ * GET /api/teacher-analytics/quiz/:quizId/student-groups/:groupType
+ */
+const getStudentGroupAnalysis = async (req, res) => {
+    try {
+        const { quizId, groupType } = req.params;
+
+        // Kiểm tra quyền truy cập
+        if (!['admin', 'teacher'].includes(req.roleName)) {
+            return res.status(403).json({ error: 'Không có quyền truy cập' });
+        }
+
+        // Validate groupType
+        const validGroups = ['excellent', 'good', 'average', 'weak'];
+        if (!validGroups.includes(groupType)) {
+            return res.status(400).json({
+                error: 'Group type không hợp lệ',
+                valid_types: validGroups
+            });
+        }
+
+        // Lấy thông tin quiz
+        const quiz = await Quiz.findByPk(quizId, {
+            include: [
+                {
+                    model: Question,
+                    as: 'Questions',
+                    through: { attributes: [] },
+                    attributes: ['question_id', 'question_text', 'level_id', 'lo_id'],
+                    include: [
+                        {
+                            model: Level,
+                            as: 'Level',
+                            attributes: ['level_id', 'name']
+                        },
+                        {
+                            model: LO,
+                            as: 'LO',
+                            attributes: ['lo_id', 'name', 'description']
+                        }
+                    ]
+                },
+                {
+                    model: Course,
+                    as: 'Course',
+                    attributes: ['course_id', 'name']
+                }
+            ]
+        });
+
+        if (!quiz) {
+            return res.status(404).json({ error: 'Không tìm thấy quiz' });
+        }
+
+        // Lấy kết quả quiz
+        const quizResults = await QuizResult.findAll({
+            where: { quiz_id: quizId },
+            include: [
+                {
+                    model: User,
+                    as: 'Student',
+                    attributes: ['user_id', 'name', 'email']
+                }
+            ]
+        });
+
+        // Lấy lịch sử trả lời câu hỏi
+        const questionHistory = await UserQuestionHistory.findAll({
+            where: { quiz_id: quizId },
+            include: [
+                {
+                    model: User,
+                    as: 'User',
+                    attributes: ['user_id', 'name', 'email']
+                },
+                {
+                    model: Question,
+                    as: 'Question',
+                    attributes: ['question_id', 'question_text', 'level_id', 'lo_id']
+                }
+            ]
+        });
+
+    // Phân nhóm học sinh
+    const studentGroups = categorizeStudentsByPerformance(quizResults, questionHistory, quiz.Questions.length);
+        const targetGroup = studentGroups[groupType];
+
+        if (!targetGroup || targetGroup.students.length === 0) {
+            return res.status(404).json({
+                error: `Không có học sinh nào trong nhóm ${groupType}`
+            });
+        }
+
+        // Phân tích chi tiết cho nhóm này
+        const groupUserIds = targetGroup.students.map(s => s.user_id);
+        const groupQuestionHistory = questionHistory.filter(h => groupUserIds.includes(h.user_id));
+
+        // Phân tích LO cho nhóm
+        const groupLOAnalysis = analyzeLOPerformance(quiz.Questions, groupQuestionHistory);
+
+        // Phân tích Level cho nhóm
+        const groupLevelAnalysis = analyzeLevelPerformance(quiz.Questions, groupQuestionHistory);
+
+        // Tính toán thống kê nhóm
+        const groupStats = {
+            group_name: groupType,
+            student_count: targetGroup.students.length,
+            score_range: {
+                min: Math.min(...targetGroup.students.map(s => s.score)),
+                max: Math.max(...targetGroup.students.map(s => s.score)),
+                average: targetGroup.students.reduce((sum, s) => sum + s.score, 0) / targetGroup.students.length
+            },
+            completion_stats: {
+                total_questions: quiz.Questions.length,
+                average_correct: targetGroup.students.reduce((sum, s) => sum + s.correct_answers, 0) / targetGroup.students.length,
+                average_time_per_question: targetGroup.students.reduce((sum, s) => sum + s.average_time_per_question, 0) / targetGroup.students.length
+            }
+        };
+
+        // Tạo recommendations cụ thể cho nhóm
+        const groupRecommendations = [];
+
+        if (groupType === 'weak') {
+            groupRecommendations.push({
+                type: 'immediate_action',
+                suggestion: 'Tổ chức buổi ôn tập riêng cho nhóm này',
+                priority: 'high'
+            });
+            groupRecommendations.push({
+                type: 'teaching_method',
+                suggestion: 'Sử dụng phương pháp giảng dạy trực quan và thực hành nhiều hơn',
+                priority: 'high'
+            });
+        } else if (groupType === 'excellent') {
+            groupRecommendations.push({
+                type: 'challenge',
+                suggestion: 'Đưa ra các bài tập nâng cao và dự án thực tế',
+                priority: 'medium'
+            });
+            groupRecommendations.push({
+                type: 'mentoring',
+                suggestion: 'Khuyến khích làm mentor cho các nhóm khác',
+                priority: 'medium'
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                quiz_info: {
+                    quiz_id: quiz.quiz_id,
+                    name: quiz.name,
+                    course_name: quiz.Course?.name,
+                    total_questions: quiz.Questions.length
+                },
+                group_overview: {
+                    ...groupStats,
+                    insights: targetGroup.insights,
+                    recommendations: groupRecommendations
+                },
+                students: targetGroup.students,
+                learning_outcome_analysis: groupLOAnalysis,
+                difficulty_level_analysis: groupLevelAnalysis,
+                generated_at: new Date()
+            }
+        });
+
+    } catch (error) {
+        console.error('Error in getStudentGroupAnalysis:', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Lỗi khi phân tích nhóm học sinh',
+            details: error.message
+        });
+    }
+};
+
+/**
+ * API: So sánh performance giữa các quiz
+ * GET /api/teacher-analytics/quiz-comparison
+ */
+const getQuizComparison = async (req, res) => {
+    try {
+        const { quiz_ids, course_id } = req.query;
+
+        // Kiểm tra quyền truy cập
+        if (!['admin', 'teacher'].includes(req.roleName)) {
+            return res.status(403).json({ error: 'Không có quyền truy cập' });
+        }
+
+        let quizIds = [];
+
+        if (quiz_ids) {
+            // So sánh các quiz cụ thể
+            quizIds = quiz_ids.split(',').map(id => parseInt(id));
+        } else if (course_id) {
+            // Lấy tất cả quiz của course
+            const quizzes = await Quiz.findAll({
+                where: { course_id: parseInt(course_id) },
+                attributes: ['quiz_id'],
+                limit: 10 // Giới hạn để tránh quá tải
+            });
+            quizIds = quizzes.map(q => q.quiz_id);
+        } else {
+            return res.status(400).json({
+                error: 'Cần cung cấp quiz_ids hoặc course_id'
+            });
+        }
+
+        if (quizIds.length < 2) {
+            return res.status(400).json({
+                error: 'Cần ít nhất 2 quiz để so sánh'
+            });
+        }
+
+        // Lấy thông tin và kết quả của tất cả quiz (tối ưu hóa với Promise.all)
+        const quizComparisons = [];
+
+        // Giới hạn số lượng quiz để tránh timeout
+        const limitedQuizIds = quizIds.slice(0, 5);
+
+        // Lấy tất cả dữ liệu song song
+        const quizPromises = limitedQuizIds.map(async (quizId) => {
+            const [quiz, quizResults, questionHistory] = await Promise.all([
+                Quiz.findByPk(quizId, {
+                    include: [
+                        {
+                            model: Question,
+                            as: 'Questions',
+                            through: { attributes: [] },
+                            attributes: ['question_id', 'level_id', 'lo_id']
+                        },
+                        {
+                            model: Course,
+                            as: 'Course',
+                            attributes: ['course_id', 'name']
+                        }
+                    ]
+                }),
+                QuizResult.findAll({
+                    where: { quiz_id: quizId },
+                    attributes: ['score', 'status']
+                }),
+                UserQuestionHistory.findAll({
+                    where: { quiz_id: quizId },
+                    attributes: ['is_correct']
+                })
+            ]);
+
+            if (!quiz) return null;
+
+            // Tính toán metrics
+            const totalParticipants = quizResults.length;
+            const completedParticipants = quizResults.filter(r => r.status === 'completed').length;
+            const averageScore = totalParticipants > 0 ?
+                quizResults.reduce((acc, curr) => acc + curr.score, 0) / totalParticipants : 0;
+
+            const totalAttempts = questionHistory.length;
+            const correctAttempts = questionHistory.filter(h => h.is_correct).length;
+            const overallAccuracy = totalAttempts > 0 ? (correctAttempts / totalAttempts) * 100 : 0;
+
+            return {
+                quiz_id: quiz.quiz_id,
+                quiz_name: quiz.name,
+                course_name: quiz.Course?.name,
+                total_questions: quiz.Questions.length,
+                total_participants: totalParticipants,
+                completion_rate: totalParticipants > 0 ? (completedParticipants / totalParticipants) * 100 : 0,
+                average_score: parseFloat(averageScore.toFixed(2)),
+                overall_accuracy: parseFloat(overallAccuracy.toFixed(2))
+            };
+        });
+
+        // Chờ tất cả promise hoàn thành và lọc kết quả null
+        const results = await Promise.all(quizPromises);
+        const validResults = results.filter(result => result !== null);
+        quizComparisons.push(...validResults);
+
+        // Tạo insights so sánh
+        const comparisonInsights = [];
+
+        const avgScores = quizComparisons.map(q => q.average_score);
+        const bestQuiz = quizComparisons.find(q => q.average_score === Math.max(...avgScores));
+        const worstQuiz = quizComparisons.find(q => q.average_score === Math.min(...avgScores));
+
+        if (bestQuiz && worstQuiz && bestQuiz.quiz_id !== worstQuiz.quiz_id) {
+            comparisonInsights.push({
+                type: 'performance_comparison',
+                message: `Quiz "${bestQuiz.quiz_name}" có điểm trung bình cao nhất (${bestQuiz.average_score}), quiz "${worstQuiz.quiz_name}" thấp nhất (${worstQuiz.average_score})`
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                quiz_comparisons: quizComparisons,
+                comparison_insights: comparisonInsights,
+                summary: {
+                    total_quizzes_compared: quizComparisons.length,
+                    average_score_across_quizzes: parseFloat((avgScores.reduce((a, b) => a + b, 0) / avgScores.length).toFixed(2)),
+                    best_performing_quiz: bestQuiz,
+                    worst_performing_quiz: worstQuiz
+                },
+                generated_at: new Date()
+            }
+        });
+
+    } catch (error) {
+        console.error('Error in getQuizComparison:', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Lỗi khi so sánh quiz',
+            details: error.message
+        });
+    }
+};
+
+/**
+ * API: Lấy phân tích chi tiết cá nhân học sinh với insights
+ * GET /api/teacher-analytics/quiz/:quizId/student/:userId/detailed-analysis
+ */
+const getStudentDetailedAnalysis = async (req, res) => {
+    try {
+        const { quizId, userId } = req.params;
+
+        // Kiểm tra quyền truy cập
+        if (!['admin', 'teacher'].includes(req.roleName)) {
+            return res.status(403).json({ error: 'Không có quyền truy cập' });
+        }
+
+        // Lấy thông tin quiz
+        const quiz = await Quiz.findByPk(quizId, {
+            include: [
+                {
+                    model: Question,
+                    as: 'Questions',
+                    through: { attributes: [] },
+                    attributes: ['question_id', 'question_text', 'level_id', 'lo_id', 'explanation'],
+                    include: [
+                        {
+                            model: Level,
+                            as: 'Level',
+                            attributes: ['level_id', 'name']
+                        },
+                        {
+                            model: LO,
+                            as: 'LO',
+                            attributes: ['lo_id', 'name', 'description']
+                        },
+                        {
+                            model: Answer,
+                            as: 'Answers',
+                            attributes: ['answer_id', 'answer_text', 'iscorrect']
+                        }
+                    ]
+                },
+                {
+                    model: Course,
+                    as: 'Course',
+                    attributes: ['course_id', 'name']
+                }
+            ]
+        });
+
+        if (!quiz) {
+            return res.status(404).json({ error: 'Không tìm thấy quiz' });
+        }
+
+        // Lấy thông tin học sinh
+        const student = await User.findByPk(userId, {
+            attributes: ['user_id', 'name', 'email']
+        });
+
+        if (!student) {
+            return res.status(404).json({ error: 'Không tìm thấy học sinh' });
+        }
+
+        // Lấy kết quả quiz của học sinh
+        const quizResult = await QuizResult.findOne({
+            where: { quiz_id: quizId, user_id: userId }
+        });
+
+        if (!quizResult) {
+            return res.status(404).json({ error: 'Học sinh chưa làm quiz này' });
+        }
+
+        // Lấy lịch sử trả lời câu hỏi của học sinh (chỉ trong quiz này)
+        const questionHistory = await UserQuestionHistory.findAll({
+            where: { quiz_id: quizId, user_id: userId },
+            include: [
+                {
+                    model: Question,
+                    as: 'Question',
+                    attributes: ['question_id', 'question_text', 'level_id', 'lo_id', 'explanation'],
+                    include: [
+                        {
+                            model: Level,
+                            as: 'Level',
+                            attributes: ['level_id', 'name']
+                        },
+                        {
+                            model: LO,
+                            as: 'LO',
+                            attributes: ['lo_id', 'name', 'description']
+                        },
+                        {
+                            model: Answer,
+                            as: 'Answers',
+                            attributes: ['answer_id', 'answer_text', 'iscorrect']
+                        }
+                    ]
+                }
+            ],
+            order: [['attempt_date', 'ASC']]
+        });
+
+        // Chỉ tính attempt ĐẦU TIÊN cho mỗi câu hỏi trong quiz này
+        const firstAttemptByQuestion = {};
+        questionHistory.forEach(h => {
+            const qid = h.question_id;
+            const t = new Date(h.created_at || h.attempt_date);
+            const cur = firstAttemptByQuestion[qid];
+            if (!cur || t < new Date(cur.created_at || cur.attempt_date)) {
+                firstAttemptByQuestion[qid] = h;
+            }
+        });
+        const firstAttempts = Object.values(firstAttemptByQuestion);
+
+        // Phân tích chi tiết từng câu hỏi (dựa trên attempt đầu tiên)
+        const questionAnalysis = firstAttempts.map(history => {
+            const question = history.Question;
+            const correctAnswer = question.Answers?.find(a => a.iscorrect);
+            const selectedAnswer = question.Answers?.find(a => a.answer_id === history.selected_answer);
+
+            let insights = [];
+            let recommendations = [];
+
+            if (!history.is_correct) {
+                insights.push('Câu trả lời sai');
+                if (question.explanation) {
+                    recommendations.push(`Xem lại giải thích: ${question.explanation}`);
+                }
+                recommendations.push(`Ôn tập lại LO: ${question.LO?.name}`);
+
+                if (history.time_spent > 120) {
+                    insights.push('Mất nhiều thời gian suy nghĩ - có thể chưa nắm vững kiến thức');
+                    recommendations.push('Cần củng cố kiến thức cơ bản');
+                }
+            } else {
+                insights.push('Câu trả lời đúng');
+                if (history.time_spent < 30) {
+                    insights.push('Trả lời nhanh và chính xác - nắm vững kiến thức');
+                }
+            }
+
+            return {
+                question_id: question.question_id,
+                question_text: question.question_text,
+                level: question.Level?.name,
+                lo: question.LO?.name,
+                selected_answer_text: selectedAnswer?.answer_text || 'Không có đáp án',
+                correct_answer_text: correctAnswer?.answer_text || 'Không xác định',
+                is_correct: history.is_correct,
+                time_spent: history.time_spent,
+                attempt_date: history.attempt_date,
+                insights,
+                recommendations
+            };
+        });
+
+        // Phân tích theo LO (dựa trên attempt đầu tiên)
+        const loPerformance = {};
+        firstAttempts.forEach(history => {
+            const loId = history.Question.lo_id;
+            const loName = history.Question.LO?.name || 'Unknown LO';
+
+            if (!loPerformance[loId]) {
+                loPerformance[loId] = {
+                    lo_name: loName,
+                    total_questions: 0,
+                    correct_answers: 0,
+                    total_time: 0
+                };
+            }
+
+            loPerformance[loId].total_questions++;
+            if (history.is_correct) loPerformance[loId].correct_answers++;
+            loPerformance[loId].total_time += history.time_spent || 0;
+        });
+
+        const loAnalysis = Object.values(loPerformance).map(lo => {
+            const accuracy = (lo.correct_answers / lo.total_questions) * 100;
+            const avgTime = lo.total_time / lo.total_questions;
+
+            let performance_level = 'good';
+            let insights = [];
+            let recommendations = [];
+
+            if (accuracy < 50) {
+                performance_level = 'weak';
+                insights.push(`LO yếu - chỉ đúng ${accuracy.toFixed(1)}%`);
+                recommendations.push(`Cần ôn tập kỹ LO: ${lo.lo_name}`);
+            } else if (accuracy < 80) {
+                performance_level = 'average';
+                insights.push(`LO trung bình - đúng ${accuracy.toFixed(1)}%`);
+                recommendations.push(`Luyện tập thêm LO: ${lo.lo_name}`);
+            } else {
+                insights.push(`LO tốt - đúng ${accuracy.toFixed(1)}%`);
+            }
+
+            return {
+                ...lo,
+                accuracy: parseFloat(accuracy.toFixed(2)),
+                average_time: parseFloat(avgTime.toFixed(2)),
+                performance_level,
+                insights,
+                recommendations
+            };
+        });
+
+        // Tạo tổng kết và recommendations cho học sinh
+        const overallInsights = [];
+        const overallRecommendations = [];
+
+    const totalQuizQuestions = quiz.Questions.length;
+    const correctAnswers = firstAttempts.filter(h => h.is_correct).length;
+    const attemptedCount = firstAttempts.length;
+    const accuracy = attemptedCount > 0 && totalQuizQuestions > 0 ? (correctAnswers / totalQuizQuestions) * 100 : null;
+    const avgTime = attemptedCount > 0 ? firstAttempts.reduce((sum, h) => sum + (h.time_spent || 0), 0) / attemptedCount : null;
+
+        if (accuracy === null) {
+            overallInsights.push('Chưa có dữ liệu làm bài trong quiz này');
+            overallRecommendations.push('Thực hiện bài quiz để có phân tích chi tiết');
+        } else if (accuracy < 50) {
+            overallInsights.push('Kết quả chưa tốt - cần cải thiện nhiều');
+            overallRecommendations.push('Cần hỗ trợ đặc biệt và ôn tập từ cơ bản');
+        } else if (accuracy < 70) {
+            overallInsights.push('Kết quả trung bình - có thể cải thiện');
+            overallRecommendations.push('Tăng cường luyện tập và ôn tập');
+        } else if (accuracy < 85) {
+            overallInsights.push('Kết quả tốt - cần duy trì');
+            overallRecommendations.push('Tiếp tục duy trì và phát triển');
+        } else {
+            overallInsights.push('Kết quả xuất sắc');
+            overallRecommendations.push('Có thể thử thách với bài tập nâng cao');
+        }
+
+        if (avgTime !== null && avgTime > 120) {
+            overallInsights.push('Thời gian làm bài chậm - cần rèn luyện tốc độ');
+            overallRecommendations.push('Luyện tập để tăng tốc độ làm bài');
+        }
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                quiz_info: {
+                    quiz_id: quiz.quiz_id,
+                    name: quiz.name,
+                    course_name: quiz.Course?.name,
+                    total_questions: quiz.Questions.length
+                },
+                student_info: {
+                    user_id: student.user_id,
+                    name: student.name,
+                    email: student.email
+                },
+                performance_summary: {
+                    score: quizResult.score,
+                    total_questions: totalQuizQuestions,
+                    correct_answers: correctAnswers,
+                    accuracy: accuracy === null ? null : parseFloat(accuracy.toFixed(2)),
+                    average_time_per_question: avgTime === null ? null : parseFloat(avgTime.toFixed(2)),
+                    completion_time: quizResult.completion_time,
+                    status: quizResult.status
+                },
+                overall_insights: {
+                    insights: overallInsights,
+                    recommendations: overallRecommendations
+                },
+                learning_outcome_analysis: loAnalysis,
+                question_by_question_analysis: questionAnalysis,
+                generated_at: new Date()
+            }
+        });
+
+    } catch (error) {
+        console.error('Error in getStudentDetailedAnalysis:', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Lỗi khi phân tích chi tiết học sinh',
+            details: error.message
+        });
+    }
+};
+
+/**
+ * API: Lấy insights và recommendations tổng hợp cho giảng viên
+ * GET /api/teacher-analytics/quiz/:quizId/teaching-insights
+ */
+const getTeachingInsights = async (req, res) => {
+    try {
+        const quizId = req.params.quizId;
+
+        // Kiểm tra quyền truy cập
+        if (!['admin', 'teacher'].includes(req.roleName)) {
+            return res.status(403).json({ error: 'Không có quyền truy cập' });
+        }
+
+        // Lấy thông tin quiz
+        const quiz = await Quiz.findByPk(quizId, {
+            include: [
+                {
+                    model: Question,
+                    as: 'Questions',
+                    through: { attributes: [] },
+                    attributes: ['question_id', 'question_text', 'level_id', 'lo_id'],
+                    include: [
+                        {
+                            model: Level,
+                            as: 'Level',
+                            attributes: ['level_id', 'name']
+                        },
+                        {
+                            model: LO,
+                            as: 'LO',
+                            attributes: ['lo_id', 'name', 'description']
+                        }
+                    ]
+                },
+                {
+                    model: Course,
+                    as: 'Course',
+                    attributes: ['course_id', 'name', 'subject_id'],
+                    include: [
+                        {
+                            model: Subject,
+                            as: 'Subject',
+                            attributes: ['subject_id', 'name']
+                        }
+                    ]
+                }
+            ]
+        });
+
+        if (!quiz) {
+            return res.status(404).json({ error: 'Không tìm thấy quiz' });
+        }
+
+        // Lấy dữ liệu cần thiết
+        const quizResults = await QuizResult.findAll({
+            where: { quiz_id: quizId },
+            include: [
+                {
+                    model: User,
+                    as: 'Student',
+                    attributes: ['user_id', 'name', 'email']
+                }
+            ]
+        });
+
+        const questionHistory = await UserQuestionHistory.findAll({
+            where: { quiz_id: quizId }
+        });
+
+        // Phân tích cơ bản
+        const totalParticipants = quizResults.length;
+        const completedParticipants = quizResults.filter(r => r.status === 'completed').length;
+        const averageScore = totalParticipants > 0 ?
+            quizResults.reduce((acc, curr) => acc + curr.score, 0) / totalParticipants : 0;
+
+        // Phân tích chi tiết
+    const loAnalysis = analyzeLOPerformance(quiz.Questions, questionHistory);
+    const levelAnalysis = analyzeLevelPerformance(quiz.Questions, questionHistory);
+    const studentGroups = categorizeStudentsByPerformance(quizResults, questionHistory, quiz.Questions.length);
+
+        // Tạo insights nâng cao
+        const teachingInsights = {
+            // Insights về curriculum
+            curriculum_insights: [],
+
+            // Insights về phương pháp giảng dạy
+            teaching_method_insights: [],
+
+            // Insights về học sinh
+            student_insights: [],
+
+            // Recommendations hành động
+            action_recommendations: [],
+
+            // Priorities
+            priority_actions: []
+        };
+
+        // Phân tích curriculum
+        const weakLOs = loAnalysis.filter(lo => lo.performance_level === 'weak');
+        const strongLOs = loAnalysis.filter(lo => lo.performance_level === 'good');
+
+        if (weakLOs.length > 0) {
+            teachingInsights.curriculum_insights.push({
+                type: 'weakness',
+                message: `${weakLOs.length} LO có hiệu suất thấp: ${weakLOs.map(lo => lo.lo_name).join(', ')}`,
+                impact: 'high',
+                affected_students: weakLOs.reduce((sum, lo) => sum + lo.students_attempted, 0)
+            });
+
+            teachingInsights.action_recommendations.push({
+                category: 'curriculum_revision',
+                action: 'Xem xét điều chỉnh nội dung giảng dạy cho các LO yếu',
+                priority: 'high',
+                timeline: 'immediate',
+                affected_los: weakLOs.map(lo => lo.lo_name)
+            });
+        }
+
+        if (strongLOs.length > weakLOs.length) {
+            teachingInsights.curriculum_insights.push({
+                type: 'strength',
+                message: `${strongLOs.length} LO có hiệu suất tốt - phương pháp giảng dạy hiệu quả`,
+                impact: 'positive'
+            });
+        }
+
+        // Phân tích phương pháp giảng dạy
+        const avgTimePerQuestion = questionHistory.length > 0 ?
+            questionHistory.reduce((sum, h) => sum + (h.time_spent || 0), 0) / questionHistory.length : 0;
+
+        if (avgTimePerQuestion > 120) {
+            teachingInsights.teaching_method_insights.push({
+                type: 'time_concern',
+                message: 'Học sinh mất nhiều thời gian trả lời (trung bình ' + avgTimePerQuestion.toFixed(1) + 's) - có thể câu hỏi khó hiểu',
+                suggestion: 'Xem xét đơn giản hóa ngôn ngữ câu hỏi hoặc bổ sung ví dụ minh họa'
+            });
+
+            teachingInsights.action_recommendations.push({
+                category: 'question_improvement',
+                action: 'Rà soát và cải thiện độ rõ ràng của câu hỏi',
+                priority: 'medium',
+                timeline: 'next_quiz'
+            });
+        }
+
+        // Phân tích học sinh
+        const weakStudentRatio = studentGroups.weak.students.length / totalParticipants;
+        const mediumStudentRatio = studentGroups.medium.students.length / totalParticipants;
+        const excellentStudentRatio = studentGroups.excellent.students.length / totalParticipants;
+
+        if (weakStudentRatio > 0.3) {
+            teachingInsights.student_insights.push({
+                type: 'concern',
+                message: `${(weakStudentRatio * 100).toFixed(1)}% học sinh có kết quả yếu (4-6 điểm) - cần can thiệp`,
+                affected_count: studentGroups.weak.students.length
+            });
+
+            teachingInsights.priority_actions.push({
+                action: 'Tổ chức lớp phụ đạo cho nhóm học sinh yếu',
+                urgency: 'high',
+                estimated_time: '2-3 tuần',
+                expected_outcome: 'Cải thiện hiểu biết cơ bản'
+            });
+        }
+
+        if (mediumStudentRatio > 0.3) {
+            teachingInsights.student_insights.push({
+                type: 'attention',
+                message: `${(mediumStudentRatio * 100).toFixed(1)}% học sinh trung bình (6-7.5 điểm) - cần hỗ trợ thêm`,
+                affected_count: studentGroups.medium.students.length
+            });
+
+            teachingInsights.action_recommendations.push({
+                category: 'support',
+                action: 'Tăng cường hỗ trợ cho nhóm học sinh trung bình',
+                priority: 'medium',
+                timeline: 'next_week'
+            });
+        }
+
+        if (excellentStudentRatio > 0.4) {
+            teachingInsights.student_insights.push({
+                type: 'opportunity',
+                message: `${(excellentStudentRatio * 100).toFixed(1)}% học sinh xuất sắc (trên 9 điểm) - có thể tận dụng làm peer tutor`,
+                opportunity_count: studentGroups.excellent.students.length
+            });
+
+            teachingInsights.action_recommendations.push({
+                category: 'peer_learning',
+                action: 'Tổ chức chương trình peer tutoring',
+                priority: 'medium',
+                timeline: 'next_month',
+                benefits: ['Tăng cường học tập nhóm', 'Phát triển kỹ năng lãnh đạo cho học sinh giỏi']
+            });
+        }
+
+        // Tạo summary insights
+        const summaryInsights = {
+            overall_assessment: averageScore >= 70 ? 'positive' : averageScore >= 50 ? 'mixed' : 'concerning',
+            key_strengths: [],
+            main_challenges: [],
+            immediate_actions_needed: teachingInsights.priority_actions.length,
+            long_term_improvements: teachingInsights.action_recommendations.filter(r => r.timeline !== 'immediate').length
+        };
+
+        if (averageScore >= 70) {
+            summaryInsights.key_strengths.push('Điểm trung bình tốt');
+        }
+        if (completedParticipants / totalParticipants >= 0.8) {
+            summaryInsights.key_strengths.push('Tỷ lệ hoàn thành cao');
+        }
+        if (strongLOs.length > weakLOs.length) {
+            summaryInsights.key_strengths.push('Đa số LO được nắm vững');
+        }
+
+        if (weakLOs.length > 0) {
+            summaryInsights.main_challenges.push(`${weakLOs.length} LO cần cải thiện`);
+        }
+        if (weakStudentRatio > 0.2) {
+            summaryInsights.main_challenges.push('Tỷ lệ học sinh yếu (4-6 điểm) cao');
+        }
+        if (mediumStudentRatio > 0.3) {
+            summaryInsights.main_challenges.push('Tỷ lệ học sinh trung bình (6-7.5 điểm) cao');
+        }
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                quiz_info: {
+                    quiz_id: quiz.quiz_id,
+                    name: quiz.name,
+                    course_name: quiz.Course?.name,
+                    subject_name: quiz.Course?.Subject?.name
+                },
+                summary_insights: summaryInsights,
+                detailed_insights: teachingInsights,
+                metrics: {
+                    total_participants: totalParticipants,
+                    average_score: parseFloat(averageScore.toFixed(2)),
+                    completion_rate: parseFloat(((completedParticipants / totalParticipants) * 100).toFixed(2)),
+                    weak_los_count: weakLOs.length,
+                    strong_los_count: strongLOs.length,
+                    weak_students_count: studentGroups.weak.students.length,
+                    medium_students_count: studentGroups.medium.students.length,
+                    excellent_students_count: studentGroups.excellent.students.length
+                },
+                generated_at: new Date()
+            }
+        });
+
+    } catch (error) {
+        console.error('Error in getTeachingInsights:', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Lỗi khi tạo insights giảng dạy',
+            details: error.message
+        });
+    }
+};
+
+/**
+ * API: Lấy benchmark và so sánh với historical data
+ * GET /api/teacher-analytics/quiz/:quizId/benchmark
+ */
+const getQuizBenchmark = async (req, res) => {
+    try {
+        const quizId = req.params.quizId;
+        const { compare_with_course = true, compare_with_teacher = true } = req.query;
+
+        // Kiểm tra quyền truy cập
+        if (!['admin', 'teacher'].includes(req.roleName)) {
+            return res.status(403).json({ error: 'Không có quyền truy cập' });
+        }
+
+        // Lấy thông tin quiz hiện tại
+        const currentQuiz = await Quiz.findByPk(quizId, {
+            include: [
+                {
+                    model: Course,
+                    as: 'Course',
+                    attributes: ['course_id', 'name', 'subject_id'],
+                    include: [
+                        {
+                            model: Subject,
+                            as: 'Subject',
+                            attributes: ['subject_id', 'name']
+                        }
+                    ]
+                }
+            ]
+        });
+
+        if (!currentQuiz) {
+            return res.status(404).json({ error: 'Không tìm thấy quiz' });
+        }
+
+        // Lấy kết quả quiz hiện tại
+        const currentResults = await QuizResult.findAll({
+            where: { quiz_id: quizId }
+        });
+
+        const currentQuestionHistory = await UserQuestionHistory.findAll({
+            where: { quiz_id: quizId }
+        });
+
+        // Tính metrics cho quiz hiện tại
+        const currentMetrics = {
+            total_participants: currentResults.length,
+            average_score: currentResults.length > 0 ?
+                currentResults.reduce((sum, r) => sum + r.score, 0) / currentResults.length : 0,
+            completion_rate: currentResults.length > 0 ?
+                (currentResults.filter(r => r.status === 'completed').length / currentResults.length) * 100 : 0,
+            pass_rate: currentResults.length > 0 ?
+                (currentResults.filter(r => r.score >= 50).length / currentResults.length) * 100 : 0,
+            excellence_rate: currentResults.length > 0 ?
+                (currentResults.filter(r => r.score >= 85).length / currentResults.length) * 100 : 0
+        };
+
+        const benchmarkData = {
+            current_quiz: {
+                quiz_id: currentQuiz.quiz_id,
+                name: currentQuiz.name,
+                course_name: currentQuiz.Course?.name,
+                subject_name: currentQuiz.Course?.Subject?.name,
+                metrics: currentMetrics
+            },
+            comparisons: {},
+            insights: [],
+            recommendations: []
+        };
+
+        // Khai báo courseMetrics ở ngoài để sử dụng cho performance ranking
+        let courseMetrics = [];
+
+        // So sánh với các quiz khác trong cùng course
+        if (compare_with_course === 'true' && currentQuiz.course_id) {
+            const courseQuizzes = await Quiz.findAll({
+                where: {
+                    course_id: currentQuiz.course_id,
+                    quiz_id: { [Op.ne]: quizId },
+                    status: 'finished'
+                },
+                limit: 10,
+                order: [['update_time', 'DESC']]
+            });
+
+            // Tối ưu hóa với Promise.all và giới hạn số lượng
+            const limitedQuizzes = courseQuizzes.slice(0, 5);
+            const metricsPromises = limitedQuizzes.map(async (quiz) => {
+                const results = await QuizResult.findAll({
+                    where: { quiz_id: quiz.quiz_id },
+                    attributes: ['score', 'status']
+                });
+
+                if (results.length > 0) {
+                    return {
+                        quiz_id: quiz.quiz_id,
+                        quiz_name: quiz.name,
+                        average_score: results.reduce((sum, r) => sum + r.score, 0) / results.length,
+                        completion_rate: (results.filter(r => r.status === 'completed').length / results.length) * 100,
+                        pass_rate: (results.filter(r => r.score >= 50).length / results.length) * 100,
+                        excellence_rate: (results.filter(r => r.score >= 85).length / results.length) * 100
+                    };
+                }
+                return null;
+            });
+
+            const metricsResults = await Promise.all(metricsPromises);
+            const validMetrics = metricsResults.filter(m => m !== null);
+            courseMetrics.push(...validMetrics);
+
+            if (courseMetrics.length > 0) {
+                const courseAverage = {
+                    average_score: courseMetrics.reduce((sum, m) => sum + m.average_score, 0) / courseMetrics.length,
+                    completion_rate: courseMetrics.reduce((sum, m) => sum + m.completion_rate, 0) / courseMetrics.length,
+                    pass_rate: courseMetrics.reduce((sum, m) => sum + m.pass_rate, 0) / courseMetrics.length,
+                    excellence_rate: courseMetrics.reduce((sum, m) => sum + m.excellence_rate, 0) / courseMetrics.length
+                };
+
+                benchmarkData.comparisons.course_benchmark = {
+                    comparison_base: `${courseMetrics.length} quiz khác trong course`,
+                    course_average: courseAverage,
+                    current_vs_average: {
+                        score_difference: parseFloat((currentMetrics.average_score - courseAverage.average_score).toFixed(2)),
+                        completion_difference: parseFloat((currentMetrics.completion_rate - courseAverage.completion_rate).toFixed(2)),
+                        pass_rate_difference: parseFloat((currentMetrics.pass_rate - courseAverage.pass_rate).toFixed(2)),
+                        excellence_difference: parseFloat((currentMetrics.excellence_rate - courseAverage.excellence_rate).toFixed(2))
+                    }
+                };
+
+                // Tạo insights dựa trên so sánh
+                const scoreDiff = currentMetrics.average_score - courseAverage.average_score;
+                if (scoreDiff > 10) {
+                    benchmarkData.insights.push({
+                        type: 'positive',
+                        category: 'performance',
+                        message: `Quiz này có điểm trung bình cao hơn ${scoreDiff.toFixed(1)} điểm so với trung bình course`,
+                        impact: 'high'
+                    });
+                } else if (scoreDiff < -10) {
+                    benchmarkData.insights.push({
+                        type: 'concern',
+                        category: 'performance',
+                        message: `Quiz này có điểm trung bình thấp hơn ${Math.abs(scoreDiff).toFixed(1)} điểm so với trung bình course`,
+                        impact: 'high'
+                    });
+
+                    benchmarkData.recommendations.push({
+                        category: 'improvement',
+                        suggestion: 'Xem xét điều chỉnh độ khó hoặc phương pháp giảng dạy',
+                        priority: 'high'
+                    });
+                }
+
+                const passRateDiff = currentMetrics.pass_rate - courseAverage.pass_rate;
+                if (passRateDiff < -15) {
+                    benchmarkData.insights.push({
+                        type: 'concern',
+                        category: 'pass_rate',
+                        message: `Tỷ lệ đậu thấp hơn ${Math.abs(passRateDiff).toFixed(1)}% so với trung bình course`,
+                        impact: 'high'
+                    });
+                }
+            }
+        }
+
+        // Tạo performance ranking
+        if (benchmarkData.comparisons.course_benchmark) {
+            const allQuizzes = [
+                { name: 'Quiz hiện tại', score: currentMetrics.average_score },
+                ...courseMetrics.map(m => ({ name: m.quiz_name, score: m.average_score }))
+            ];
+
+            allQuizzes.sort((a, b) => b.score - a.score);
+            const currentRank = allQuizzes.findIndex(q => q.name === 'Quiz hiện tại') + 1;
+
+            benchmarkData.performance_ranking = {
+                current_rank: currentRank,
+                total_quizzes: allQuizzes.length,
+                percentile: parseFloat(((allQuizzes.length - currentRank + 1) / allQuizzes.length * 100).toFixed(1)),
+                top_performers: allQuizzes.slice(0, 3),
+                ranking_insights: currentRank <= 3 ? 'Top performer' :
+                    currentRank <= allQuizzes.length * 0.5 ? 'Above average' : 'Below average'
+            };
+        }
+
+        // Tạo improvement suggestions
+        if (currentMetrics.average_score < 60) {
+            benchmarkData.recommendations.push({
+                category: 'urgent_improvement',
+                suggestion: 'Điểm trung bình thấp - cần xem xét lại toàn bộ phương pháp giảng dạy',
+                priority: 'critical',
+                timeline: 'immediate'
+            });
+        }
+
+        if (currentMetrics.completion_rate < 70) {
+            benchmarkData.recommendations.push({
+                category: 'engagement',
+                suggestion: 'Tỷ lệ hoàn thành thấp - cần tăng cường động lực học tập',
+                priority: 'high',
+                timeline: 'next_quiz'
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                ...benchmarkData,
+                generated_at: new Date()
+            }
+        });
+
+    } catch (error) {
+        console.error('Error in getQuizBenchmark:', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Lỗi khi tạo benchmark',
+            details: error.message
+        });
+    }
+};
+
+/**
+ * API Debug: Kiểm tra dữ liệu quiz để debug
+ * GET /api/teacher-analytics/debug/:quizId
+ */
+const debugQuizData = async (req, res) => {
+    try {
+        const quizId = req.params.quizId;
+
+        console.log('=== DEBUG QUIZ DATA ===');
+        console.log('Quiz ID:', quizId);
+
+        // Kiểm tra quiz
+        const quiz = await Quiz.findByPk(quizId, {
+            include: [
+                {
+                    model: Question,
+                    as: 'Questions',
+                    through: { attributes: [] },
+                    attributes: ['question_id', 'question_text', 'level_id', 'lo_id'],
+                    include: [
+                        { model: Level, as: 'Level', attributes: ['level_id', 'name'] },
+                        { model: LO, as: 'LO', attributes: ['lo_id', 'name'] }
+                    ]
+                },
+                { 
+                    model: Course, 
+                    as: 'Course', 
+                    attributes: ['course_id', 'name', 'subject_id'],
+                    include: [
+                        { model: Subject, as: 'Subject', attributes: ['subject_id', 'name'] }
+                    ]
+                }
+            ]
+        });
+
+        console.log('Quiz found:', !!quiz);
+        if (!quiz) {
+            return res.status(404).json({ error: 'Quiz not found', quiz_id: quizId });
+        }
+
+        // Kiểm tra QuizResults
+        const quizResults = await QuizResult.findAll({
+            where: { quiz_id: quizId },
+            include: [
+                {
+                    model: User,
+                    as: 'Student',
+                    attributes: ['user_id', 'name', 'email']
+                }
+            ]
+        });
+
+        console.log('QuizResults count:', quizResults.length);
+
+        // Kiểm tra UserQuestionHistory
+        const questionHistory = await UserQuestionHistory.findAll({
+            where: { quiz_id: quizId }
+        });
+
+        console.log('UserQuestionHistory count:', questionHistory.length);
+
+    // Test phân nhóm
+    const studentGroups = categorizeStudentsByPerformance(quizResults, questionHistory, quiz.Questions.length);
+
+        console.log('Student groups:', {
+            excellent: studentGroups.excellent.students.length,
+            good: studentGroups.good.students.length,
+            average: studentGroups.average.students.length,
+            medium: studentGroups.medium.students.length,
+            weak: studentGroups.weak.students.length
+        });
+
+        return res.status(200).json({
+            success: true,
+            debug_data: {
+                quiz_info: {
+                    quiz_id: quiz.quiz_id,
+                    name: quiz.name,
+                    course_name: quiz.Course?.name,
+                    subject_name: quiz.Course?.Subject?.name,
+                    total_questions: quiz.Questions?.length || 0
+                },
+                data_counts: {
+                    quiz_results: quizResults.length,
+                    question_history: questionHistory.length
+                },
+                sample_quiz_results: quizResults.slice(0, 3).map(r => ({
+                    user_id: r.user_id,
+                    student_name: r.Student?.name,
+                    score: r.score,
+                    status: r.status,
+                    completion_time: r.completion_time
+                })),
+                sample_question_history: questionHistory.slice(0, 3).map(h => ({
+                    user_id: h.user_id,
+                    question_id: h.question_id,
+                    is_correct: h.is_correct,
+                    time_spent: h.time_spent
+                })),
+                student_groups_count: {
+                    excellent: studentGroups.excellent.students.length,
+                    good: studentGroups.good.students.length,
+                    average: studentGroups.average.students.length,
+                    medium: studentGroups.medium.students.length,
+                    weak: studentGroups.weak.students.length
+                },
+                sample_students_by_group: {
+                    excellent: studentGroups.excellent.students.slice(0, 2),
+                    good: studentGroups.good.students.slice(0, 2),
+                    average: studentGroups.average.students.slice(0, 2),
+                    medium: studentGroups.medium.students.slice(0, 2),
+                    weak: studentGroups.weak.students.slice(0, 2)
+                }
+            }
+        });
+
+    } catch (error) {
+        console.error('Debug error:', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Debug failed',
+            details: error.message
+        });
+    }
+};
+
+// ==================== NEW CHART ENDPOINTS ====================
+
+/**
+ * GET /api/teacher-analytics/quiz/:quizId/student-groups
+ * Lấy dữ liệu tất cả nhóm học sinh để vẽ biểu đồ cột
+ */
+const getStudentGroupsChart = async (req, res) => {
+    try {
+        const { quizId } = req.params;
+
+        // Lấy dữ liệu quiz và results
+        const quiz = await Quiz.findByPk(quizId, {
+            include: [
+                {
+                    model: Question,
+                    as: 'Questions',
+                    through: { attributes: [] },
+                    include: [
+                        { model: LO, as: 'LO' },
+                        { model: Level }
+                    ]
+                }
+            ]
+        });
+
+        if (!quiz) {
+            return res.status(404).json({
+                success: false,
+                error: 'Quiz không tồn tại'
+            });
+        }
+
+        const quizResults = await QuizResult.findAll({
+            where: { quiz_id: quizId },
+            include: [{ model: User, as: 'Student', attributes: ['user_id', 'name', 'email'] }]
+        });
+
+        if (quizResults.length === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'Chưa có học sinh nào làm quiz này'
+            });
+        }
+
+        // Lấy lịch sử trả lời câu hỏi
+        const questionHistory = await UserQuestionHistory.findAll({
+            where: {
+                quiz_id: quizId,
+                question_id: {
+                    [Op.in]: quiz.Questions.map(q => q.question_id)
+                }
+            }
+        });
+
+    // Phân nhóm học sinh
+    const studentGroups = categorizeStudentsByPerformance(quizResults, questionHistory, quiz.Questions.length);
+
+        // Tạo dữ liệu cho biểu đồ cột
+        const chartData = [
+            {
+                group_name: "excellent",
+                display_name: "Xuất sắc",
+                student_count: studentGroups.excellent.students.length,
+                percentage: parseFloat(((studentGroups.excellent.students.length / quizResults.length) * 100).toFixed(1)),
+                score_range: {
+                    min: studentGroups.excellent.students.length > 0 ? Math.min(...studentGroups.excellent.students.map(s => s.score)) : 0,
+                    max: studentGroups.excellent.students.length > 0 ? Math.max(...studentGroups.excellent.students.map(s => s.score)) : 0,
+                    average: studentGroups.excellent.students.length > 0 ? parseFloat((studentGroups.excellent.students.reduce((sum, s) => sum + s.score, 0) / studentGroups.excellent.students.length).toFixed(1)) : 0
+                },
+                color: "#4CAF50"
+            },
+            {
+                group_name: "good",
+                display_name: "Giỏi",
+                student_count: studentGroups.good.students.length,
+                percentage: parseFloat(((studentGroups.good.students.length / quizResults.length) * 100).toFixed(1)),
+                score_range: {
+                    min: studentGroups.good.students.length > 0 ? Math.min(...studentGroups.good.students.map(s => s.score)) : 0,
+                    max: studentGroups.good.students.length > 0 ? Math.max(...studentGroups.good.students.map(s => s.score)) : 0,
+                    average: studentGroups.good.students.length > 0 ? parseFloat((studentGroups.good.students.reduce((sum, s) => sum + s.score, 0) / studentGroups.good.students.length).toFixed(1)) : 0
+                },
+                color: "#2196F3"
+            },
+            {
+                group_name: "average",
+                display_name: "Khá",
+                student_count: studentGroups.average.students.length,
+                percentage: parseFloat(((studentGroups.average.students.length / quizResults.length) * 100).toFixed(1)),
+                score_range: {
+                    min: studentGroups.average.students.length > 0 ? Math.min(...studentGroups.average.students.map(s => s.score)) : 0,
+                    max: studentGroups.average.students.length > 0 ? Math.max(...studentGroups.average.students.map(s => s.score)) : 0,
+                    average: studentGroups.average.students.length > 0 ? parseFloat((studentGroups.average.students.reduce((sum, s) => sum + s.score, 0) / studentGroups.average.students.length).toFixed(1)) : 0
+                },
+                color: "#FF9800"
+            },
+            {
+                group_name: "medium",
+                display_name: "Trung bình",
+                student_count: studentGroups.medium.students.length,
+                percentage: parseFloat(((studentGroups.medium.students.length / quizResults.length) * 100).toFixed(1)),
+                score_range: {
+                    min: studentGroups.medium.students.length > 0 ? Math.min(...studentGroups.medium.students.map(s => s.score)) : 0,
+                    max: studentGroups.medium.students.length > 0 ? Math.max(...studentGroups.medium.students.map(s => s.score)) : 0,
+                    average: studentGroups.medium.students.length > 0 ? parseFloat((studentGroups.medium.students.reduce((sum, s) => sum + s.score, 0) / studentGroups.medium.students.length).toFixed(1)) : 0
+                },
+                color: "#FFC107"
+            },
+            {
+                group_name: "weak",
+                display_name: "Yếu",
+                student_count: studentGroups.weak.students.length,
+                percentage: parseFloat(((studentGroups.weak.students.length / quizResults.length) * 100).toFixed(1)),
+                score_range: {
+                    min: studentGroups.weak.students.length > 0 ? Math.min(...studentGroups.weak.students.map(s => s.score)) : 0,
+                    max: studentGroups.weak.students.length > 0 ? Math.max(...studentGroups.weak.students.map(s => s.score)) : 0,
+                    average: studentGroups.weak.students.length > 0 ? parseFloat((studentGroups.weak.students.reduce((sum, s) => sum + s.score, 0) / studentGroups.weak.students.length).toFixed(1)) : 0
+                },
+                color: "#F44336"
+            }
+        ];
+
+        res.json({
+            success: true,
+            data: {
+                chart_data: chartData,
+                total_students: quizResults.length,
+                chart_config: {
+                    x_axis: "group_name",
+                    y_axis: "student_count",
+                    tooltip_fields: ["percentage", "score_range"],
+                    clickable: true
+                }
+            }
+        });
+
+    } catch (error) {
+        console.error('Error in getStudentGroupsChart:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Lỗi server khi lấy dữ liệu biểu đồ nhóm học sinh',
+            details: error.message
+        });
+    }
+};
+
+/**
+ * GET /api/teacher-analytics/quiz/:quizId/learning-outcomes
+ * Lấy dữ liệu phân tích Learning Outcomes để vẽ biểu đồ cột nhóm
+ * Trục tung: Số lượng sinh viên
+ * Trục hoành: Các LO
+ * Mỗi nhóm cột bao gồm: Tỷ lệ hoàn thành và số lượng sinh viên theo LO
+ */
+const getLearningOutcomesChart = async (req, res) => {
+    try {
+        const { quizId } = req.params;
+
+        // Lấy dữ liệu quiz và questions
+        const quiz = await Quiz.findByPk(quizId, {
+            include: [
+                {
+                    model: Question,
+                    as: 'Questions',
+                    through: { attributes: [] },
+                    include: [
+                        { model: LO, as: 'LO' },
+                        { model: Level }
+                    ]
+                }
+            ]
+        });
+
+        if (!quiz) {
+            return res.status(404).json({
+                success: false,
+                error: 'Quiz không tồn tại'
+            });
+        }
+
+        // Lấy danh sách học sinh đã làm quiz
+        const quizResults = await QuizResult.findAll({
+            where: { quiz_id: quizId },
+            attributes: ['user_id']
+        });
+        const studentIds = quizResults.map(qr => qr.user_id);
+        const totalStudents = studentIds.length;
+
+        if (totalStudents === 0) {
+            return res.json({
+                success: true,
+                data: {
+                    chart_data: [],
+                    summary: {
+                        total_students: 0,
+                        total_los: 0
+                    }
+                }
+            });
+        }
+
+        // Lấy lịch sử trả lời câu hỏi của các học sinh này
+        const questionHistory = await UserQuestionHistory.findAll({
+            where: {
+                quiz_id: quizId,
+                question_id: {
+                    [Op.in]: quiz.Questions.map(q => q.question_id)
+                },
+                user_id: {
+                    [Op.in]: studentIds
+                }
+            }
+        });
+
+        // Gom câu hỏi theo LO
+        const loQuestions = {};
+        quiz.Questions.forEach(q => {
+            if (!loQuestions[q.lo_id]) {
+                loQuestions[q.lo_id] = {
+                    questions: [],
+                    lo_name: q.LO?.name || 'Unknown LO',
+                    lo_description: q.LO?.description || ''
+                };
+            }
+            loQuestions[q.lo_id].questions.push(q.question_id);
+        });
+
+        // Phân tích từng LO để tạo dữ liệu biểu đồ cột nhóm
+        const chartData = Object.entries(loQuestions).map(([loId, loData]) => {
+            const questionIds = loData.questions;
+            const loName = loData.lo_name;
+            const loDescription = loData.lo_description;
+
+            let studentsCompleted = 0; // Sinh viên hoàn thành LO (>= 70%)
+            let studentsPartial = 0;   // Sinh viên hoàn thành một phần (40-69%)
+            let studentsNotStarted = 0; // Sinh viên chưa hoàn thành (<40%)
+            let totalCorrectAnswers = 0;
+            let totalAnswers = 0;
+
+            // Phân tích từng sinh viên
+            studentIds.forEach(userId => {
+                // Lấy attempt đầu tiên của học sinh này với mỗi câu hỏi thuộc LO
+                const userAttempts = questionHistory.filter(h =>
+                    h.user_id === userId && questionIds.includes(h.question_id)
+                );
+
+                // Chỉ lấy attempt đầu tiên cho mỗi câu hỏi
+                const firstAttemptsByQ = {};
+                userAttempts.forEach(a => {
+                    if (!firstAttemptsByQ[a.question_id] ||
+                        new Date(a.created_at) < new Date(firstAttemptsByQ[a.question_id].created_at)) {
+                        firstAttemptsByQ[a.question_id] = a;
+                    }
+                });
+
+                const totalQuestions = questionIds.length;
+                const correctCount = Object.values(firstAttemptsByQ).filter(a => a.is_correct).length;
+                const completionPercent = totalQuestions > 0 ? (correctCount / totalQuestions) * 100 : 0;
+
+                // Phân loại sinh viên theo mức độ hoàn thành
+                if (completionPercent >= 70) {
+                    studentsCompleted++;
+                } else if (completionPercent >= 40) {
+                    studentsPartial++;
+                } else {
+                    studentsNotStarted++;
+                }
+
+                // Tính tổng để có tỷ lệ chung
+                totalCorrectAnswers += correctCount;
+                totalAnswers += totalQuestions;
+            });
+
+            // Tính tỷ lệ hoàn thành chung của LO
+            const overallCompletionRate = totalAnswers > 0 ?
+                Math.round((totalCorrectAnswers / totalAnswers) * 100) : 0;
+
+            // Phân tích chi tiết cho giáo viên
+            const averageScore = totalAnswers > 0 ? (totalCorrectAnswers / totalAnswers) * 100 : 0;
+            const difficultyLevel = getDifficultyLevel(overallCompletionRate);
+            const teachingRecommendation = getTeachingRecommendation(overallCompletionRate, studentsCompleted, totalStudents);
+
+            return {
+                lo_id: Number(loId),
+                lo_name: loName,
+                lo_description: loDescription,
+                // Dữ liệu cho biểu đồ cột nhóm
+                completion_rate: overallCompletionRate, // Tỷ lệ hoàn thành (%)
+                students_completed: studentsCompleted,   // Số sinh viên hoàn thành
+                students_partial: studentsPartial,       // Số sinh viên hoàn thành một phần
+                students_not_started: studentsNotStarted, // Số sinh viên chưa hoàn thành
+                total_students_attempted: studentsCompleted + studentsPartial + studentsNotStarted,
+                // Thống kê bổ sung cho giáo viên
+                total_questions: questionIds.length,
+                performance_level: getPerformanceLevel(overallCompletionRate),
+                average_score: Math.round(averageScore),
+                difficulty_level: difficultyLevel,
+                teaching_recommendation: teachingRecommendation,
+                // Phân tích mạnh/yếu
+                strength_weakness: {
+                    is_strength: overallCompletionRate >= 70,
+                    is_weakness: overallCompletionRate < 50,
+                    needs_attention: studentsNotStarted > 0 || studentsPartial > studentsCompleted,
+                    priority_level: getPriorityLevel(overallCompletionRate, studentsNotStarted, totalStudents)
+                }
+            };
+        });
+
+        // Sắp xếp theo tên LO
+        chartData.sort((a, b) => a.lo_name.localeCompare(b.lo_name));
+
+        // Tạo phân tích tổng quan cho giáo viên
+        const overallAnalysis = generateOverallAnalysis(chartData, totalStudents);
+
+        res.json({
+            success: true,
+            data: {
+                chart_data: chartData,
+                summary: {
+                    total_students: totalStudents,
+                    total_los: chartData.length,
+                    quiz_name: quiz.name,
+                    quiz_id: quizId
+                },
+                // Phân tích tổng quan cho giáo viên
+                teacher_insights: overallAnalysis
+            }
+        });
+    } catch (error) {
+        console.error('Error in getLearningOutcomesChart:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Lỗi server khi lấy dữ liệu LO',
+            details: error.message
+        });
+    }
+};
+
+/**
+ * Helper function để xác định mức độ hiệu suất
+ */
+const getPerformanceLevel = (completionRate) => {
+    if (completionRate >= 80) return 'excellent';
+    if (completionRate >= 70) return 'good';
+    if (completionRate >= 50) return 'average';
+    if (completionRate >= 30) return 'below_average';
+    return 'poor';
+};
+
+/**
+ * Helper function để xác định mức độ khó của LO
+ */
+const getDifficultyLevel = (completionRate) => {
+    if (completionRate >= 80) return 'easy';
+    if (completionRate >= 60) return 'moderate';
+    if (completionRate >= 40) return 'difficult';
+    return 'very_difficult';
+};
+
+/**
+ * Helper function để đưa ra khuyến nghị giảng dạy
+ */
+const getTeachingRecommendation = (completionRate, studentsCompleted, totalStudents) => {
+    if (completionRate >= 80) {
+        return 'Tốt! Có thể tăng độ khó hoặc mở rộng nội dung';
+    }
+    if (completionRate >= 60) {
+        return 'Cần ôn tập thêm với một số sinh viên';
+    }
+    if (completionRate >= 40) {
+        return 'Cần giải thích lại kiến thức cơ bản';
+    }
+    return 'Cần dạy lại từ đầu với phương pháp khác';
+};
+
+/**
+ * Helper function để xác định mức độ ưu tiên
+ */
+const getPriorityLevel = (completionRate, studentsNotStarted, totalStudents) => {
+    if (completionRate < 30) return 'urgent';
+    if (studentsNotStarted > totalStudents * 0.5) return 'high';
+    if (completionRate < 60) return 'medium';
+    return 'low';
+};
+
+/**
+ * Tạo phân tích tổng quan cho giáo viên
+ */
+const generateOverallAnalysis = (chartData, totalStudents) => {
+    const strengths = chartData.filter(lo => lo.strength_weakness.is_strength);
+    const weaknesses = chartData.filter(lo => lo.strength_weakness.is_weakness);
+    const needsAttention = chartData.filter(lo => lo.strength_weakness.needs_attention);
+
+    const averageCompletionRate = chartData.reduce((sum, lo) => sum + lo.completion_rate, 0) / chartData.length;
+
+    return {
+        overall_performance: {
+            average_completion_rate: Math.round(averageCompletionRate),
+            performance_level: getPerformanceLevel(averageCompletionRate),
+            total_los: chartData.length
+        },
+        strengths: {
+            count: strengths.length,
+            los: strengths.map(lo => ({
+                lo_name: lo.lo_name,
+                completion_rate: lo.completion_rate
+            }))
+        },
+        weaknesses: {
+            count: weaknesses.length,
+            los: weaknesses.map(lo => ({
+                lo_name: lo.lo_name,
+                completion_rate: lo.completion_rate,
+                priority: lo.strength_weakness.priority_level,
+                recommendation: lo.teaching_recommendation
+            }))
+        },
+        needs_attention: {
+            count: needsAttention.length,
+            los: needsAttention.map(lo => ({
+                lo_name: lo.lo_name,
+                students_struggling: lo.students_not_started + lo.students_partial,
+                recommendation: lo.teaching_recommendation
+            }))
+        },
+        teaching_recommendations: [
+            ...weaknesses.map(lo => `${lo.lo_name}: ${lo.teaching_recommendation}`),
+            averageCompletionRate >= 80 ? 'Lớp học có hiệu suất tốt, có thể tăng độ khó' : null,
+            averageCompletionRate < 50 ? 'Cần xem xét lại phương pháp giảng dạy tổng thể' : null
+        ].filter(Boolean)
+    };
+};
+
+/**
+ * GET /api/teacher-analytics/quiz/:quizId/learning-outcomes/:loId
+ * Chi tiết phân tích Learning Outcome khi click vào cột biểu đồ
+ */
+const getLearningOutcomeDetail = async (req, res) => {
+    try {
+        const { quizId, loId } = req.params;
+
+        // Lấy thông tin LO với thông tin chapter liên quan
+        const lo = await LO.findByPk(loId, {
+            include: [
+                {
+                    model: Chapter,
+                    as: 'Chapters',
+                    through: { model: ChapterLO },
+                    include: [
+                        {
+                            model: Subject,
+                            as: 'Subject',
+                            attributes: ['subject_id', 'name']
+                        },
+                        {
+                            model: ChapterSection,
+                            as: 'Sections',
+                            attributes: ['section_id', 'title', 'content', 'order']
+                        }
+                    ]
+                }
+            ]
+        });
+
+        if (!lo) {
+            return res.status(404).json({
+                success: false,
+                error: 'Learning Outcome không tồn tại'
+            });
+        }
+
+        // Lấy quiz trước để lấy danh sách questions
+        const quiz = await Quiz.findByPk(quizId, {
+            include: [
+                {
+                    model: Question,
+                    as: 'Questions',
+                    through: { attributes: [] },
+                    where: { lo_id: loId },
+                    include: [
+                        { model: Level },
+                        { model: Answer }
+                    ]
+                }
+            ]
+        });
+
+        if (!quiz) {
+            return res.status(404).json({
+                success: false,
+                error: 'Quiz không tồn tại'
+            });
+        }
+
+        const questions = quiz.Questions;
+
+        if (questions.length === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'Không có câu hỏi nào thuộc LO này trong quiz'
+            });
+        }
+
+        // Lấy lịch sử trả lời
+        const questionHistory = await UserQuestionHistory.findAll({
+            where: {
+                quiz_id: quizId,
+                question_id: {
+                    [Op.in]: questions.map(q => q.question_id)
+                }
+            },
+            include: [{ model: User, as: 'User', attributes: ['user_id', 'name'] }]
+        });
+
+        // Lấy quiz results để phân nhóm học sinh
+        const quizResults = await QuizResult.findAll({
+            where: { quiz_id: quizId },
+            include: [{ model: User, as: 'Student', attributes: ['user_id', 'name'] }]
+        });
+
+        // Phân tích từng câu hỏi
+        const questionBreakdown = questions.map(question => {
+            const questionAttempts = questionHistory.filter(h => h.question_id === question.question_id);
+            // Chỉ tính attempt ĐẦU TIÊN của mỗi học sinh cho câu hỏi này
+            const firstByUser = {};
+            questionAttempts.forEach(attempt => {
+                const key = attempt.user_id;
+                const t = new Date(attempt.created_at || attempt.attempt_date);
+                const cur = firstByUser[key];
+                if (!cur || t < new Date(cur.created_at || cur.attempt_date)) {
+                    firstByUser[key] = attempt;
+                }
+            });
+            const firstAttempts = Object.values(firstByUser);
+            const correctCount = firstAttempts.filter(h => h.is_correct).length;
+            const totalAttempts = firstAttempts.length;
+            const accuracy = totalAttempts > 0 ? parseFloat(((correctCount / totalAttempts) * 100).toFixed(1)) : 0;
+
+            let insights = [];
+            if (accuracy >= 80) {
+                insights.push("Câu hỏi dễ - học sinh nắm vững");
+            } else if (accuracy >= 60) {
+                insights.push("Câu hỏi trung bình - cần ôn tập thêm");
+            } else {
+                insights.push("Câu hỏi khó - cần giải thích lại");
+            }
+
+            return {
+                question_id: question.question_id,
+                question_text: question.question_text.length > 100 ?
+                    question.question_text.substring(0, 97) + '...' :
+                    question.question_text,
+                difficulty: question.Level?.name || 'Unknown',
+                correct_count: correctCount,
+                total_attempts: totalAttempts,
+                accuracy: accuracy,
+                insights: insights
+            };
+        });
+
+        // Phân tích performance học sinh theo LO
+        const studentPerformance = {};
+
+        // Tính điểm của từng học sinh cho LO này
+        quizResults.forEach(result => {
+            const userId = result.user_id;
+            const userHistory = questionHistory.filter(h => h.user_id === userId);
+            // Đếm số câu duy nhất mà sinh viên trả lời đúng (trong quiz này)
+            const correctQuestionIds = new Set(
+                userHistory.filter(h => h.is_correct).map(h => h.question_id)
+            );
+            const correctCount = correctQuestionIds.size;
+            const totalCount = questions.length;
+            const accuracy = totalCount > 0 ? parseFloat(((correctCount / totalCount) * 100).toFixed(1)) : 0;
+
+            let performanceLevel = 'weak';
+            if (accuracy >= 85) performanceLevel = 'excellent';
+            else if (accuracy >= 70) performanceLevel = 'good';
+            else if (accuracy >= 50) performanceLevel = 'average';
+
+            if (!studentPerformance[performanceLevel]) {
+                studentPerformance[performanceLevel] = [];
+            }
+
+            studentPerformance[performanceLevel].push({
+                user_id: userId,
+                name: result.Student.name,
+                correct_count: correctCount,
+                total_count: totalCount,
+                accuracy: accuracy
+            });
+        });
+
+        // Tính toán thống kê tổng quan
+        const totalQuestions = questions.length;
+        const totalAttempts = questionHistory.length;
+        const totalCorrect = questionHistory.filter(h => h.is_correct).length;
+        const overallAccuracy = totalAttempts > 0 ? parseFloat(((totalCorrect / totalAttempts) * 100).toFixed(1)) : 0;
+
+        let performanceLevel = 'weak';
+        if (overallAccuracy >= 85) performanceLevel = 'excellent';
+        else if (overallAccuracy >= 70) performanceLevel = 'good';
+        else if (overallAccuracy >= 50) performanceLevel = 'average';
+
+        // Tạo insights và recommendations
+        const insights = [];
+        const recommendations = [];
+
+        if (overallAccuracy < 50) {
+            insights.push("LO yếu - cần cải thiện đáng kể");
+            recommendations.push({
+                type: "teaching_method",
+                suggestion: "Xem xét lại phương pháp giảng dạy cho LO này",
+                priority: "high"
+            });
+        } else if (overallAccuracy < 70) {
+            insights.push("LO trung bình - cần cải thiện");
+            recommendations.push({
+                type: "curriculum",
+                suggestion: "Bổ sung thêm ví dụ minh họa và bài tập",
+                priority: "medium"
+            });
+        } else {
+            insights.push("LO tốt - duy trì phương pháp hiện tại");
+        }
+
+        // Phân tích câu hỏi khó nhất
+        const hardestQuestion = questionBreakdown.reduce((min, q) =>
+            q.accuracy < min.accuracy ? q : min, questionBreakdown[0]);
+
+        if (hardestQuestion && hardestQuestion.accuracy < 60) {
+            insights.push(`Học sinh gặp khó khăn nhất với: ${hardestQuestion.question_text}`);
+            recommendations.push({
+                type: "content_review",
+                suggestion: "Xem xét lại nội dung và cách diễn đạt câu hỏi khó",
+                priority: "medium"
+            });
+        }
+
+        res.json({
+            success: true,
+            data: {
+                lo_info: {
+                    lo_id: parseInt(loId),
+                    lo_name: lo.name,
+                    description: lo.description || "Không có mô tả",
+                    total_questions: totalQuestions,
+                    accuracy: overallAccuracy,
+                    performance_level: performanceLevel,
+                    // Thông tin chapter liên quan
+                    related_chapters: lo.Chapters?.map(chapter => ({
+                        chapter_id: chapter.chapter_id,
+                        chapter_name: chapter.name,
+                        subject: chapter.Subject ? {
+                            subject_id: chapter.Subject.subject_id,
+                            subject_name: chapter.Subject.name
+                        } : null,
+                        sections: chapter.Sections?.map(section => ({
+                            section_id: section.section_id,
+                            title: section.title,
+                            content_preview: section.content ?
+                                (section.content.length > 100 ?
+                                    section.content.substring(0, 97) + '...' :
+                                    section.content) : null,
+                            order: section.order
+                        })) || []
+                    })) || []
+                },
+                question_breakdown: questionBreakdown,
+                student_performance: Object.keys(studentPerformance).map(level => ({
+                    performance_level: level,
+                    student_count: studentPerformance[level].length,
+                    students: studentPerformance[level].slice(0, 10) // Giới hạn 10 học sinh đầu tiên
+                })),
+                insights: insights,
+                recommendations: recommendations
+            }
+        });
+
+    } catch (error) {
+        console.error('Error in getLearningOutcomeDetail:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Lỗi server khi lấy chi tiết Learning Outcome',
+            details: error.message
+        });
+    }
+};
+
+/**
+ * GET /api/teacher-analytics/quiz/:quizId/student-groups/:groupName
+ * Chi tiết nhóm học sinh khi click vào cột biểu đồ
+ */
+const getStudentGroupDetail = async (req, res) => {
+    try {
+        const { quizId, groupName } = req.params;
+
+        // Validate groupName
+        const validGroups = ['excellent', 'good', 'average', 'medium', 'weak'];
+        if (!validGroups.includes(groupName)) {
+            return res.status(400).json({
+                success: false,
+                error: 'Tên nhóm không hợp lệ. Chỉ chấp nhận: excellent, good, average, medium, weak'
+            });
+        }
+
+        // Lấy dữ liệu quiz và results
+        const quiz = await Quiz.findByPk(quizId, {
+            include: [
+                {
+                    model: Question,
+                    as: 'Questions',
+                    through: { attributes: [] },
+                    include: [
+                        { model: LO, as: 'LO' },
+                        { model: Level }
+                    ]
+                }
+            ]
+        });
+
+        if (!quiz) {
+            return res.status(404).json({
+                success: false,
+                error: 'Quiz không tồn tại'
+            });
+        }
+
+        const quizResults = await QuizResult.findAll({
+            where: { quiz_id: quizId },
+            include: [{ model: User, as: 'Student', attributes: ['user_id', 'name', 'email'] }]
+        });
+
+        if (quizResults.length === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'Chưa có học sinh nào làm quiz này'
+            });
+        }
+
+        // Lấy lịch sử trả lời câu hỏi
+        const questionHistory = await UserQuestionHistory.findAll({
+            where: {
+                quiz_id: quizId,
+                question_id: {
+                    [Op.in]: quiz.Questions.map(q => q.question_id)
+                }
+            }
+        });
+
+    // Phân nhóm học sinh
+    const studentGroups = categorizeStudentsByPerformance(quizResults, questionHistory, quiz.Questions.length);
+        const selectedGroup = studentGroups[groupName];
+
+        if (!selectedGroup || selectedGroup.students.length === 0) {
+            return res.status(404).json({
+                success: false,
+                error: `Không có học sinh nào trong nhóm ${groupName}`
+            });
+        }
+
+        // Tạo insights cho nhóm
+        const groupInsights = [];
+        const recommendations = [];
+
+        const groupDisplayNames = {
+            excellent: 'Xuất sắc',
+            good: 'Giỏi',
+            average: 'Khá',
+            medium: 'Trung bình',
+            weak: 'Yếu'
+        };
+
+        const avgScore = selectedGroup.students.reduce((sum, s) => sum + s.score, 0) / selectedGroup.students.length;
+        const avgPercentage = selectedGroup.students.reduce((sum, s) => sum + s.percentage_score, 0) / selectedGroup.students.length;
+
+        // Tạo insights dựa trên nhóm
+        if (groupName === 'excellent') {
+            groupInsights.push(`Nhóm xuất sắc (trên 9 điểm) với ${selectedGroup.students.length} học sinh`);
+            groupInsights.push(`Điểm trung bình: ${avgScore.toFixed(1)}/10 (${avgPercentage.toFixed(1)}%)`);
+            recommendations.push({
+                type: "enrichment",
+                suggestion: "Tạo thêm bài tập nâng cao cho nhóm này",
+                priority: "medium"
+            });
+        } else if (groupName === 'good') {
+            groupInsights.push(`Nhóm giỏi (8-9 điểm) với ${selectedGroup.students.length} học sinh`);
+            groupInsights.push(`Điểm trung bình: ${avgScore.toFixed(1)}/10 (${avgPercentage.toFixed(1)}%)`);
+            recommendations.push({
+                type: "development",
+                suggestion: "Hướng dẫn thêm để đạt mức xuất sắc",
+                priority: "medium"
+            });
+        } else if (groupName === 'average') {
+            groupInsights.push(`Nhóm khá (7.5-8 điểm) với ${selectedGroup.students.length} học sinh`);
+            groupInsights.push(`Điểm trung bình: ${avgScore.toFixed(1)}/10 (${avgPercentage.toFixed(1)}%)`);
+            recommendations.push({
+                type: "improvement",
+                suggestion: "Tăng cường luyện tập để cải thiện kết quả",
+                priority: "medium"
+            });
+        } else if (groupName === 'medium') {
+            groupInsights.push(`Nhóm trung bình (6-7.5 điểm) với ${selectedGroup.students.length} học sinh`);
+            groupInsights.push(`Điểm trung bình: ${avgScore.toFixed(1)}/10 (${avgPercentage.toFixed(1)}%)`);
+            recommendations.push({
+                type: "support",
+                suggestion: "Cần hỗ trợ thêm để cải thiện",
+                priority: "high"
+            });
+        } else if (groupName === 'weak') {
+            groupInsights.push(`Nhóm yếu (4-6 điểm) cần hỗ trợ đặc biệt với ${selectedGroup.students.length} học sinh`);
+            groupInsights.push(`Điểm trung bình: ${avgScore.toFixed(1)}/10 (${avgPercentage.toFixed(1)}%)`);
+            recommendations.push({
+                type: "intervention",
+                suggestion: "Cần can thiệp sớm và hỗ trợ cá nhân hóa",
+                priority: "high"
+            });
+            recommendations.push({
+                type: "review",
+                suggestion: "Xem xét lại phương pháp giảng dạy cho nhóm này",
+                priority: "high"
+            });
+        }
+
+        res.json({
+            success: true,
+            data: {
+                group_info: {
+                    group_name: groupName,
+                    display_name: groupDisplayNames[groupName],
+                    student_count: selectedGroup.students.length,
+                    average_score: parseFloat(avgScore.toFixed(1)),
+                    average_percentage: parseFloat(avgPercentage.toFixed(1)),
+                    threshold: selectedGroup.threshold
+                },
+                students: selectedGroup.students.map(student => ({
+                    user_id: student.user_id,
+                    name: student.name,
+                    email: student.email,
+                    score: student.score,
+                    percentage_score: student.percentage_score,
+                    completion_time: student.completion_time,
+                    average_time_per_question: student.average_time_per_question,
+                    total_questions_attempted: student.total_questions_attempted,
+                    correct_answers: student.correct_answers
+                })),
+                insights: groupInsights,
+                recommendations: recommendations
+            }
+        });
+
+    } catch (error) {
+        console.error('Error in getStudentGroupDetail:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Lỗi server khi lấy chi tiết nhóm học sinh',
+            details: error.message
+        });
+    }
+};
+
+/**
+ * GET /api/teacher-analytics/quiz/:quizId/student/:userId/lo-analysis
+ * Chi tiết phân tích Learning Outcomes của từng học sinh
+ */
+const getStudentLOAnalysis = async (req, res) => {
+    try {
+        const { quizId, userId } = req.params;
+
+        // Lấy thông tin học sinh
+        const student = await User.findByPk(userId, {
+            attributes: ['user_id', 'name', 'email']
+        });
+
+        if (!student) {
+            return res.status(404).json({
+                success: false,
+                error: 'Học sinh không tồn tại'
+            });
+        }
+
+        // Lấy thông tin quiz và questions
+        const quiz = await Quiz.findByPk(quizId, {
+            include: [
+                {
+                    model: Question,
+                    as: 'Questions',
+                    through: { attributes: [] },
+                    include: [
+                        {
+                            model: LO,
+                            as: 'LO',
+                            attributes: ['lo_id', 'name', 'description']
+                        },
+                        { model: Level }
+                    ]
+                }
+            ]
+        });
+
+        if (!quiz) {
+            return res.status(404).json({
+                success: false,
+                error: 'Quiz không tồn tại'
+            });
+        }
+
+        // Lấy kết quả quiz của học sinh
+        const quizResult = await QuizResult.findOne({
+            where: {
+                quiz_id: quizId,
+                user_id: userId
+            }
+        });
+
+        if (!quizResult) {
+            return res.status(404).json({
+                success: false,
+                error: 'Học sinh chưa làm quiz này'
+            });
+        }
+
+        // Lấy lịch sử trả lời của học sinh (CHỈ trong quiz này)
+        const studentHistory = await UserQuestionHistory.findAll({
+            where: {
+                user_id: userId,
+                quiz_id: quizId,
+                question_id: {
+                    [Op.in]: quiz.Questions.map(q => q.question_id)
+                }
+            },
+            order: [['attempt_date', 'ASC']]
+        });
+
+        // Nhóm câu hỏi theo LO
+        const loGroups = {};
+        quiz.Questions.forEach(question => {
+            const loId = question.lo_id;
+            const loName = question.LO?.name || 'Unknown LO';
+            const loDescription = question.LO?.description || '';
+
+            if (!loGroups[loId]) {
+                loGroups[loId] = {
+                    lo_id: loId,
+                    lo_name: loName,
+                    lo_description: loDescription,
+                    questions: [],
+                    total_questions: 0,
+                    attempted_questions: 0,
+                    correct_answers: 0,
+                    total_time: 0,
+                    attempts: []
+                };
+            }
+
+            loGroups[loId].questions.push(question);
+            loGroups[loId].total_questions++;
+        });
+
+        // Phân tích performance theo từng LO
+        const loAnalysis = Object.values(loGroups).map(lo => {
+            // Lấy lịch sử trả lời cho các câu hỏi của LO này
+            const allLoHistory = studentHistory.filter(h =>
+                lo.questions.some(q => q.question_id === h.question_id)
+            );
+
+            // Nhóm theo question_id để lấy attempt ĐẦU TIÊN của mỗi câu hỏi (bỏ qua retry)
+            const questionFirstAttempts = {};
+            allLoHistory.forEach(attempt => {
+                const questionId = attempt.question_id;
+                if (!questionFirstAttempts[questionId] || new Date(attempt.created_at) < new Date(questionFirstAttempts[questionId].created_at)) {
+                    questionFirstAttempts[questionId] = attempt;
+                }
+            });
+
+            // Chỉ sử dụng attempt ĐẦU TIÊN của mỗi câu hỏi
+            const loHistory = Object.values(questionFirstAttempts);
+
+            const attemptedQuestions = new Set(loHistory.map(h => h.question_id)).size;
+            const correctAnswers = loHistory.filter(h => h.is_correct).length;
+            const totalTime = loHistory.reduce((sum, h) => sum + (h.time_spent || 0), 0);
+            const averageTime = loHistory.length > 0 ? totalTime / loHistory.length : 0;
+
+            // Tính phần trăm đạt được
+            const achievementPercentage = lo.total_questions > 0 ?
+                parseFloat(((correctAnswers / lo.total_questions) * 100).toFixed(1)) : 0;
+
+            // Xác định performance level
+            let performanceLevel = 'weak';
+            let color = '#F44336';
+            let status = 'Yếu';
+
+            if (achievementPercentage >= 85) {
+                performanceLevel = 'excellent';
+                color = '#4CAF50';
+                status = 'Xuất sắc';
+            } else if (achievementPercentage >= 70) {
+                performanceLevel = 'good';
+                color = '#2196F3';
+                status = 'Khá';
+            } else if (achievementPercentage >= 50) {
+                performanceLevel = 'average';
+                color = '#FF9800';
+                status = 'Trung bình';
+            }
+
+            // Tạo insights cho LO
+            const insights = [];
+            const recommendations = [];
+
+            if (achievementPercentage === 100) {
+                insights.push(`Nắm vững hoàn toàn LO này (${achievementPercentage}%)`);
+                recommendations.push("Có thể làm mentor cho bạn khác về LO này");
+            } else if (achievementPercentage >= 80) {
+                insights.push(`Hiểu tốt LO này (${achievementPercentage}%)`);
+                recommendations.push("Ôn tập nhẹ để duy trì kiến thức");
+            } else if (achievementPercentage >= 60) {
+                insights.push(`Hiểu cơ bản LO này (${achievementPercentage}%)`);
+                recommendations.push("Cần luyện tập thêm để nâng cao");
+            } else if (achievementPercentage >= 40) {
+                insights.push(`Còn yếu về LO này (${achievementPercentage}%)`);
+                recommendations.push("Cần ôn tập lại lý thuyết và làm nhiều bài tập");
+            } else {
+                insights.push(`Chưa nắm được LO này (${achievementPercentage}%)`);
+                recommendations.push("Cần học lại từ đầu và được hỗ trợ thêm");
+            }
+
+            // Phân tích thời gian
+            if (averageTime > 15000) { // > 15 giây
+                insights.push("Thời gian suy nghĩ lâu - có thể chưa tự tin");
+                recommendations.push("Luyện tập thêm để tăng tốc độ giải quyết");
+            } else if (averageTime < 3000) { // < 3 giây
+                insights.push("Trả lời nhanh - có thể đã nắm vững hoặc đoán");
+            }
+
+            return {
+                lo_id: lo.lo_id,
+                lo_name: lo.lo_name,
+                lo_description: lo.lo_description,
+                total_questions: lo.total_questions,
+                attempted_questions: attemptedQuestions,
+                correct_answers: correctAnswers,
+                achievement_percentage: achievementPercentage,
+                performance_level: performanceLevel,
+                status: status,
+                color: color,
+                average_time_seconds: parseFloat(averageTime.toFixed(1)),
+                total_time_seconds: totalTime,
+                insights: insights,
+                recommendations: recommendations,
+                question_details: lo.questions.map(q => {
+                    const questionHistory = loHistory.find(h => h.question_id === q.question_id);
+                    return {
+                        question_id: q.question_id,
+                        question_text: q.question_text.length > 80 ?
+                            q.question_text.substring(0, 77) + '...' :
+                            q.question_text,
+                        difficulty: q.Level?.name || 'Unknown',
+                        is_correct: questionHistory ? questionHistory.is_correct : false,
+                        time_spent: questionHistory ? questionHistory.time_spent : 0,
+                        attempted: !!questionHistory
+                    };
+                })
+            };
+        });
+
+        // Sắp xếp theo achievement_percentage giảm dần
+        loAnalysis.sort((a, b) => b.achievement_percentage - a.achievement_percentage);
+
+        // Tính toán tổng quan
+        const totalQuestions = loAnalysis.reduce((sum, lo) => sum + lo.total_questions, 0);
+        const totalCorrect = loAnalysis.reduce((sum, lo) => sum + lo.correct_answers, 0);
+        const overallPercentage = totalQuestions > 0 ?
+            parseFloat(((totalCorrect / totalQuestions) * 100).toFixed(1)) : 0;
+
+        // Phân loại điểm mạnh/yếu
+        const strengths = loAnalysis.filter(lo => lo.achievement_percentage >= 70);
+        const weaknesses = loAnalysis.filter(lo => lo.achievement_percentage < 50);
+        const needsImprovement = loAnalysis.filter(lo =>
+            lo.achievement_percentage >= 50 && lo.achievement_percentage < 70
+        );
+
+        // Tạo insights tổng quan
+        const overallInsights = [];
+        const overallRecommendations = [];
+
+        if (strengths.length > 0) {
+            overallInsights.push(`Điểm mạnh: ${strengths.length} LO đạt từ 70% trở lên`);
+        }
+        if (weaknesses.length > 0) {
+            overallInsights.push(`Điểm yếu: ${weaknesses.length} LO dưới 50%`);
+            overallRecommendations.push({
+                type: "focus",
+                suggestion: `Tập trung cải thiện ${weaknesses.map(w => w.lo_name).join(', ')}`,
+                priority: "high"
+            });
+        }
+        if (needsImprovement.length > 0) {
+            overallInsights.push(`Cần cải thiện: ${needsImprovement.length} LO từ 50-70%`);
+        }
+
+        res.json({
+            success: true,
+            data: {
+                student_info: {
+                    user_id: parseInt(userId),
+                    name: student.name,
+                    email: student.email,
+                    quiz_score: quizResult.score,
+                    completion_time: quizResult.completion_time,
+                    overall_percentage: overallPercentage
+                },
+                quiz_info: {
+                    quiz_id: parseInt(quizId),
+                    name: quiz.name,
+                    total_questions: totalQuestions
+                },
+                lo_analysis: loAnalysis,
+                summary: {
+                    total_los: loAnalysis.length,
+                    strengths_count: strengths.length,
+                    weaknesses_count: weaknesses.length,
+                    needs_improvement_count: needsImprovement.length,
+                    strongest_lo: strengths.length > 0 ? {
+                        lo_name: strengths[0].lo_name,
+                        percentage: strengths[0].achievement_percentage
+                    } : null,
+                    weakest_lo: weaknesses.length > 0 ? {
+                        lo_name: weaknesses[weaknesses.length - 1].lo_name,
+                        percentage: weaknesses[weaknesses.length - 1].achievement_percentage
+                    } : null
+                },
+                insights: overallInsights,
+                recommendations: overallRecommendations
+            }
+        });
+
+    } catch (error) {
+        console.error('Error in getStudentLOAnalysis:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Lỗi server khi lấy phân tích LO của học sinh',
+            details: error.message
+        });
+    }
+};
+
+/**
+ * GET /api/teacher-analytics/quiz/:quizId/difficulty-lo-distribution
+ * Phân bố câu hỏi theo độ khó và Learning Outcomes - Biểu đồ Matrix/Heatmap
+ */
+const getDifficultyLODistribution = async (req, res) => {
+    try {
+        const { quizId } = req.params;
+
+        // Lấy thông tin quiz với questions, LO và Level
+        const quiz = await Quiz.findByPk(quizId, {
+            include: [
+                {
+                    model: Question,
+                    as: 'Questions',
+                    through: { attributes: [] },
+                    include: [
+                        {
+                            model: LO,
+                            as: 'LO',
+                            attributes: ['lo_id', 'name', 'description']
+                        },
+                        {
+                            model: Level,
+                            attributes: ['level_id', 'name']
+                        }
+                    ]
+                }
+            ]
+        });
+
+        if (!quiz) {
+            return res.status(404).json({
+                success: false,
+                error: 'Quiz không tồn tại'
+            });
+        }
+
+        if (quiz.Questions.length === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'Quiz chưa có câu hỏi nào'
+            });
+        }
+
+        // Lấy lịch sử trả lời câu hỏi
+        const questionHistory = await UserQuestionHistory.findAll({
+            where: {
+                question_id: {
+                    [Op.in]: quiz.Questions.map(q => q.question_id)
+                }
+            }
+        });
+
+        // Tạo danh sách unique LOs và Levels
+        const losMap = {};
+        const levelsMap = {};
+
+        quiz.Questions.forEach(question => {
+            const lo = question.LO;
+            const level = question.Level;
+
+            if (lo && !losMap[lo.lo_id]) {
+                losMap[lo.lo_id] = {
+                    lo_id: lo.lo_id,
+                    lo_name: lo.name,
+                    lo_description: lo.description || ''
+                };
+            }
+
+            if (level && !levelsMap[level.level_id]) {
+                levelsMap[level.level_id] = {
+                    level_id: level.level_id,
+                    level_name: level.name
+                };
+            }
+        });
+
+        const los = Object.values(losMap);
+        const levels = Object.values(levelsMap);
+
+        // Tạo matrix data
+        const matrixData = [];
+        const distributionStats = {
+            total_questions: quiz.Questions.length,
+            total_students: new Set(questionHistory.map(h => h.user_id)).size,
+            lo_distribution: {},
+            level_distribution: {},
+            difficulty_insights: [],
+            balance_analysis: {}
+        };
+
+        // Phân tích từng ô trong matrix (LO × Level)
+        los.forEach(lo => {
+            levels.forEach(level => {
+                // Lấy các câu hỏi thuộc LO này và Level này
+                const questionsInCell = quiz.Questions.filter(q =>
+                    q.lo_id === lo.lo_id && q.level_id === level.level_id
+                );
+
+                if (questionsInCell.length > 0) {
+                    // Lấy lịch sử trả lời cho các câu hỏi trong ô này
+                    const cellHistory = questionHistory.filter(h =>
+                        questionsInCell.some(q => q.question_id === h.question_id)
+                    );
+
+                    // Nhóm theo user_id và question_id để lấy attempt đầu tiên
+                    const userQuestionAttempts = {};
+                    cellHistory.forEach(attempt => {
+                        const key = `${attempt.user_id}_${attempt.question_id}`;
+                        if (!userQuestionAttempts[key] || new Date(attempt.created_at) < new Date(userQuestionAttempts[key].created_at)) {
+                            userQuestionAttempts[key] = attempt;
+                        }
+                    });
+
+                    const firstAttempts = Object.values(userQuestionAttempts);
+                    const correctCount = firstAttempts.filter(h => h.is_correct).length;
+                    const totalAttempts = firstAttempts.length;
+                    const accuracy = totalAttempts > 0 ? parseFloat(((correctCount / totalAttempts) * 100).toFixed(1)) : 0;
+                    const avgTime = firstAttempts.length > 0 ?
+                        firstAttempts.reduce((sum, h) => sum + (h.time_spent || 0), 0) / firstAttempts.length : 0;
+
+                    // Xác định màu sắc dựa trên accuracy
+                    let color = '#E0E0E0'; // Default gray
+                    let intensity = 0;
+
+                    if (accuracy >= 80) {
+                        color = '#4CAF50'; // Green - Easy
+                        intensity = 0.8;
+                    } else if (accuracy >= 60) {
+                        color = '#FF9800'; // Orange - Medium
+                        intensity = 0.6;
+                    } else if (accuracy >= 40) {
+                        color = '#F44336'; // Red - Hard
+                        intensity = 0.4;
+                    } else {
+                        color = '#9C27B0'; // Purple - Very Hard
+                        intensity = 0.2;
+                    }
+
+                    matrixData.push({
+                        lo_id: lo.lo_id,
+                        lo_name: lo.lo_name,
+                        level_id: level.level_id,
+                        level_name: level.level_name,
+                        question_count: questionsInCell.length,
+                        total_attempts: totalAttempts,
+                        correct_attempts: correctCount,
+                        accuracy: accuracy,
+                        average_time_seconds: parseFloat(avgTime.toFixed(1)),
+                        color: color,
+                        intensity: intensity,
+                        difficulty_assessment: accuracy >= 80 ? 'Dễ' :
+                            accuracy >= 60 ? 'Trung bình' :
+                                accuracy >= 40 ? 'Khó' : 'Rất khó',
+                        // Thêm các trường hữu ích cho frontend
+                        cell_size: Math.max(10, questionsInCell.length * 15), // Kích thước cell cho heatmap
+                        students_attempted: new Set(firstAttempts.map(h => h.user_id)).size,
+                        success_rate: parseFloat((accuracy / 100).toFixed(2)), // 0-1 scale
+                        difficulty_score: parseFloat(((100 - accuracy) / 100).toFixed(2)), // 0-1, càng cao càng khó
+                        cell_label: `${questionsInCell.length}`, // Label hiển thị trong cell
+                        tooltip_text: `${lo.lo_name} - ${level.level_name}: ${questionsInCell.length} câu, ${accuracy}% đúng`,
+                        questions: questionsInCell.map(q => ({
+                            question_id: q.question_id,
+                            question_text: q.question_text.length > 60 ?
+                                q.question_text.substring(0, 57) + '...' :
+                                q.question_text
+                        }))
+                    });
+                }
+            });
+        });
+
+        // Tính toán thống kê phân bố
+        los.forEach(lo => {
+            const loQuestions = quiz.Questions.filter(q => q.lo_id === lo.lo_id);
+            distributionStats.lo_distribution[lo.lo_name] = loQuestions.length;
+        });
+
+        levels.forEach(level => {
+            const levelQuestions = quiz.Questions.filter(q => q.level_id === level.level_id);
+            distributionStats.level_distribution[level.level_name] = levelQuestions.length;
+        });
+
+        // Phân tích cân bằng độ khó
+        const totalQuestions = quiz.Questions.length;
+        const easyCount = matrixData.filter(cell => cell.accuracy >= 80).reduce((sum, cell) => sum + cell.question_count, 0);
+        const mediumCount = matrixData.filter(cell => cell.accuracy >= 60 && cell.accuracy < 80).reduce((sum, cell) => sum + cell.question_count, 0);
+        const hardCount = matrixData.filter(cell => cell.accuracy < 60).reduce((sum, cell) => sum + cell.question_count, 0);
+
+        distributionStats.balance_analysis = {
+            easy_questions: easyCount,
+            medium_questions: mediumCount,
+            hard_questions: hardCount,
+            easy_percentage: parseFloat(((easyCount / totalQuestions) * 100).toFixed(1)),
+            medium_percentage: parseFloat(((mediumCount / totalQuestions) * 100).toFixed(1)),
+            hard_percentage: parseFloat(((hardCount / totalQuestions) * 100).toFixed(1)),
+            balance_assessment: ''
+        };
+
+        // Đánh giá cân bằng
+        const { easy_percentage, medium_percentage, hard_percentage } = distributionStats.balance_analysis;
+        if (easy_percentage > 60) {
+            distributionStats.balance_analysis.balance_assessment = 'Quiz quá dễ - cần tăng độ khó';
+            distributionStats.difficulty_insights.push('Quiz có xu hướng dễ, có thể không phân biệt được học sinh giỏi');
+        } else if (hard_percentage > 60) {
+            distributionStats.balance_analysis.balance_assessment = 'Quiz quá khó - cần giảm độ khó';
+            distributionStats.difficulty_insights.push('Quiz có xu hướng khó, có thể làm nản lòng học sinh');
+        } else if (medium_percentage > 40 && easy_percentage > 20 && hard_percentage > 20) {
+            distributionStats.balance_analysis.balance_assessment = 'Quiz có độ khó cân bằng tốt';
+            distributionStats.difficulty_insights.push('Phân bố độ khó hợp lý, phù hợp để đánh giá học sinh');
+        } else {
+            distributionStats.balance_analysis.balance_assessment = 'Quiz cần điều chỉnh để cân bằng hơn';
+        }
+
+        // Insights về LO
+        const loWithMostQuestions = Object.entries(distributionStats.lo_distribution)
+            .sort(([, a], [, b]) => b - a)[0];
+        const loWithLeastQuestions = Object.entries(distributionStats.lo_distribution)
+            .sort(([, a], [, b]) => a - b)[0];
+
+        if (loWithMostQuestions && loWithLeastQuestions && loWithMostQuestions[1] > loWithLeastQuestions[1] * 2) {
+            distributionStats.difficulty_insights.push(
+                `LO "${loWithMostQuestions[0]}" có quá nhiều câu hỏi (${loWithMostQuestions[1]}) so với "${loWithLeastQuestions[0]}" (${loWithLeastQuestions[1]})`
+            );
+        }
+
+        res.json({
+            success: true,
+            data: {
+                quiz_info: {
+                    quiz_id: parseInt(quizId),
+                    name: quiz.name,
+                    total_questions: quiz.Questions.length
+                },
+                matrix_data: matrixData,
+                chart_config: {
+                    x_axis: 'lo_name',
+                    y_axis: 'level_name',
+                    value_field: 'question_count',
+                    color_field: 'accuracy',
+                    chart_type: 'heatmap',
+                    tooltip_fields: ['question_count', 'accuracy', 'average_time_seconds', 'difficulty_assessment']
+                },
+                axes_data: {
+                    learning_outcomes: los,
+                    difficulty_levels: levels
+                },
+                distribution_stats: distributionStats,
+                insights: distributionStats.difficulty_insights,
+                recommendations: [
+                    {
+                        type: 'balance',
+                        suggestion: distributionStats.balance_analysis.balance_assessment,
+                        priority: hard_percentage > 70 || easy_percentage > 70 ? 'high' : 'medium'
+                    }
+                ]
+            }
+        });
+
+    } catch (error) {
+        console.error('Error in getDifficultyLODistribution:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Lỗi server khi lấy phân bố độ khó và LO',
+            details: error.message
+        });
+    }
+};
+
+/**
+ * Lấy danh sách câu hỏi theo LO và độ khó cho heatmap (dùng cho click từng ô)
+ * GET /api/teacher-analytics/quiz/:quizId/difficulty-lo-questions?lo_id=...&level_id=...
+ */
+const getQuestionsByDifficultyAndLO = async (req, res) => {
+    try {
+        const { quizId } = req.params;
+        const { lo_id, level_id } = req.query;
+
+        // Validate inputs
+        const parsedQuizId = parseInt(quizId);
+        const parsedLoId = parseInt(lo_id);
+        const parsedLevelId = parseInt(level_id);
+
+        if (isNaN(parsedQuizId) || isNaN(parsedLoId) || isNaN(parsedLevelId)) {
+            return res.status(400).json({ success: false, error: 'ID Quiz, LO hoặc Level không hợp lệ.' });
+        }
+
+        // Lấy danh sách câu hỏi thuộc quiz, LO và Level
+        const quizQuestions = await QuizQuestion.findAll({
+            where: { quiz_id: parsedQuizId },
+            attributes: ['question_id']
+        });
+        const questionIds = quizQuestions.map(q => q.question_id);
+
+        // Lấy các câu hỏi theo lo_id và level_id, kèm đáp án
+        const questions = await Question.findAll({
+            where: {
+                question_id: questionIds,
+                lo_id: parsedLoId,
+                level_id: parsedLevelId
+            },
+            attributes: ['question_id', 'question_text'],
+            include: [{
+                model: Answer,
+                attributes: ['answer_id', 'answer_text', 'iscorrect']
+            }]
+        });
+
+        return res.json({
+            success: true,
+            data: questions.map(q => ({
+                question_id: q.question_id,
+                question_text: q.question_text,
+                answers: q.Answers?.map(a => ({
+                    answer_id: a.answer_id,
+                    answer_text: a.answer_text,
+                    iscorrect: a.iscorrect
+                })) || []
+            }))
+        });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ success: false, error: 'Lỗi server' });
+    }
+};
+
+/**
+ * Lấy danh sách câu hỏi theo LO cho Learning Outcomes chart
+ * GET /api/teacher-analytics/quiz/:quizId/lo-questions?lo_id=...&userId=...
+ */
+const getQuestionsByLO = async (req, res) => {
+    try {
+        const { quizId } = req.params;
+        const { lo_id, userId } = req.query;
+
+        // Validate inputs
+        const parsedQuizId = parseInt(quizId);
+        const parsedLoId = parseInt(lo_id);
+        const parsedUserId = userId ? parseInt(userId) : null;
+
+        if (isNaN(parsedQuizId) || isNaN(parsedLoId)) {
+            return res.status(400).json({ success: false, error: 'ID Quiz hoặc LO không hợp lệ.' });
+        }
+
+        if (userId && isNaN(parsedUserId)) {
+            return res.status(400).json({ success: false, error: 'ID User không hợp lệ.' });
+        }
+
+        // Lấy danh sách question_id thuộc quiz này
+        const quizQuestions = await QuizQuestion.findAll({
+            where: { quiz_id: parsedQuizId },
+            attributes: ['question_id']
+        });
+        const questionIds = quizQuestions.map(q => q.question_id);
+
+        // Lấy các câu hỏi theo lo_id, kèm đáp án
+        const questions = await Question.findAll({
+            where: {
+                question_id: questionIds,
+                lo_id: parsedLoId
+            },
+            attributes: ['question_id', 'question_text'],
+            include: [{
+                model: Answer,
+                attributes: ['answer_id', 'answer_text', 'iscorrect']
+            }]
+        });
+
+        // Nếu có userId, lấy thêm lịch sử trả lời của user
+        let userAnswers = {};
+        if (parsedUserId) {
+            const questionHistory = await UserQuestionHistory.findAll({
+                where: {
+                    quiz_id: parsedQuizId,
+                    user_id: parsedUserId,
+                    question_id: questionIds.filter(qId =>
+                        questions.some(q => q.question_id === qId)
+                    )
+                },
+                attributes: ['question_id', 'selected_answer', 'is_correct', 'time_spent', 'attempt_date'],
+                order: [['attempt_date', 'ASC']]
+            });
+
+            // Tạo map để dễ tra cứu
+            questionHistory.forEach(history => {
+                userAnswers[history.question_id] = {
+                    selected_answer_id: history.selected_answer,
+                    is_correct: history.is_correct,
+                    time_spent: history.time_spent,
+                    attempt_date: history.attempt_date
+                };
+            });
+        }
+
+        return res.json({
+            success: true,
+            data: questions.map(q => {
+                const userAnswer = userAnswers[q.question_id];
+                const selectedAnswer = userAnswer ?
+                    q.Answers?.find(a => a.answer_id === userAnswer.selected_answer_id) : null;
+
+                return {
+                    question_id: q.question_id,
+                    question_text: q.question_text,
+                    answers: q.Answers?.map(a => ({
+                        answer_id: a.answer_id,
+                        answer_text: a.answer_text,
+                        iscorrect: a.iscorrect
+                    })) || [],
+                    // Thêm thông tin lựa chọn của sinh viên nếu có
+                    student_answer: userAnswer ? {
+                        selected_answer_id: userAnswer.selected_answer_id,
+                        selected_answer_text: selectedAnswer?.answer_text || 'Không xác định',
+                        is_correct: userAnswer.is_correct,
+                        time_spent: userAnswer.time_spent,
+                        attempt_date: userAnswer.attempt_date
+                    } : null
+                };
+            })
+        });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ success: false, error: 'Lỗi server' });
+    }
+};
+
+/**
+ * Simple test endpoint để debug performance issues
+ * GET /api/teacher-analytics/test/:quizId
+ */
+const testPerformance = async (req, res) => {
+    try {
+        const quizId = req.params.quizId;
+        console.log(`Testing performance for quiz ${quizId}`);
+        
+        const startTime = Date.now();
+        
+        // Test simple quiz query
+        const quiz = await Quiz.findByPk(quizId, {
+            attributes: ['quiz_id', 'name', 'course_id']
+        });
+        
+        if (!quiz) {
+            return res.status(404).json({ error: 'Quiz not found' });
+        }
+        
+        const simpleTime = Date.now() - startTime;
+        console.log(`Simple quiz query took: ${simpleTime}ms`);
+        
+        // Test with includes
+        const complexStartTime = Date.now();
+        const complexQuiz = await Quiz.findByPk(quizId, {
+            include: [
+                {
+                    model: Course,
+                    as: 'Course',
+                    attributes: ['course_id', 'name']
+                }
+            ]
+        });
+        
+        const complexTime = Date.now() - complexStartTime;
+        console.log(`Complex quiz query took: ${complexTime}ms`);
+        
+        const totalTime = Date.now() - startTime;
+        
+        return res.json({
+            success: true,
+            performance: {
+                total_time: totalTime,
+                simple_query_time: simpleTime,
+                complex_query_time: complexTime
+            },
+            quiz: {
+                quiz_id: quiz.quiz_id,
+                name: quiz.name,
+                course_id: quiz.course_id,
+                course_name: complexQuiz?.Course?.name
+            }
+        });
+        
+    } catch (error) {
+        console.error('Performance test error:', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Performance test failed',
+            details: error.message
+        });
+    }
+};
+
+module.exports = {
+    analyzeLOPerformance,
+    analyzeLevelPerformance,
+    categorizeStudentsByPerformance,
+    generateTeacherInsights,
+    getComprehensiveQuizReport,
+    getStudentGroupAnalysis,
+    getQuizComparison,
+    getStudentDetailedAnalysis,
+    getTeachingInsights,
+    getQuizBenchmark,
+    debugQuizData,
+    getStudentGroupsChart,
+    getLearningOutcomesChart,
+    getLearningOutcomeDetail,
+    getStudentGroupDetail,
+    getStudentLOAnalysis,
+    getDifficultyLODistribution,
+    getQuestionsByDifficultyAndLO,
+    getQuestionsByLO,
+    getRetestRecommendation,
+    getRetestImprovement,
+    testPerformance
+};

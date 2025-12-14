@@ -1,0 +1,1130 @@
+// backend/src/services/quizRacingService.js
+// Real-time Quiz Racing Service with Skills Integration
+
+const {
+  Skill,
+  UserSkill,
+  QuizSkillLoadout,
+  SkillUsageHistory,
+  ActiveSkillEffect,
+} = require("../models");
+const { setCache, getCache, deleteCache } = require("../redis/utils");
+const SkillService = require("./skillService");
+
+class QuizRacingService {
+  constructor(io) {
+    this.io = io;
+  }
+
+  // =====================================================
+  // QUIZ RACING SESSION MANAGEMENT
+  // =====================================================
+
+  /**
+   * Initialize quiz racing session
+   */
+  async initializeQuizRacing(quizSessionId, participants, totalQuestions) {
+    try {
+      const sessionData = {
+        quiz_session_id: quizSessionId,
+        participants: participants.map((p) => ({
+          user_id: p.user_id,
+          username: p.username,
+          current_score: 0,
+          current_streak: 0,
+          energy_percent: 0,
+          position: 0,
+          skills_used: [],
+          active_effects: [],
+          loadout: null,
+        })),
+        total_questions: totalQuestions,
+        current_question_index: 0,
+        round_number: 1,
+        global_events: [],
+        session_start_time: Date.now(),
+        quiz_timer: null,
+      };
+
+      // Cache session data
+      await setCache(
+        `quiz_racing:${quizSessionId}`,
+        JSON.stringify(sessionData),
+        7200
+      ); // 2 hours
+
+      // Initialize participant loadouts
+      for (const participant of participants) {
+        await this.loadParticipantSkills(quizSessionId, participant.user_id);
+      }
+
+      // Emit session initialized
+      this.io.to(`quiz:${quizSessionId}`).emit("quiz-racing-initialized", {
+        session_id: quizSessionId,
+        participants: sessionData.participants,
+        total_questions: totalQuestions,
+        timestamp: Date.now(),
+      });
+
+      return { success: true, session_data: sessionData };
+    } catch (error) {
+      console.error("Error initializing quiz racing:", error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Load participant skills and loadout
+   */
+  async loadParticipantSkills(quizSessionId, userId) {
+    try {
+      // Get user's quiz loadout
+      const loadout = await QuizSkillLoadout.findOne({
+        where: {
+          user_id: userId,
+          quiz_session_id: quizSessionId,
+        },
+        include: [
+          { model: Skill, as: "Skill1" },
+          { model: Skill, as: "Skill2" },
+          { model: Skill, as: "Skill3" },
+          { model: Skill, as: "Skill4" },
+        ],
+      });
+
+      if (!loadout) {
+        console.warn(
+          `No loadout found for user ${userId} in quiz ${quizSessionId}`
+        );
+        return null;
+      }
+
+      const skillsData = [
+        loadout.Skill1,
+        loadout.Skill2,
+        loadout.Skill3,
+        loadout.Skill4,
+      ].filter((skill) => skill !== null);
+
+      // Cache user's loadout for quick access
+      await setCache(
+        `quiz_racing:${quizSessionId}:loadout:${userId}`,
+        JSON.stringify({
+          loadout_id: loadout.loadout_id,
+          skills: skillsData,
+          skills_used: [],
+          available_skill: null,
+        }),
+        7200
+      );
+
+      return skillsData;
+    } catch (error) {
+      console.error("Error loading participant skills:", error);
+      return null;
+    }
+  }
+
+  // =====================================================
+  // ENERGY & SKILL ACTIVATION SYSTEM
+  // =====================================================
+
+  /**
+   * Update player energy after answering question
+   */
+  async updatePlayerEnergy(
+    quizSessionId,
+    userId,
+    isCorrect,
+    hasSpeedBonus,
+    hasStreakBonus
+  ) {
+    try {
+      const sessionData = await this.getSessionData(quizSessionId);
+      if (!sessionData) return { success: false, error: "Session not found" };
+
+      const participant = sessionData.participants.find(
+        (p) => p.user_id === userId
+      );
+      if (!participant)
+        return { success: false, error: "Participant not found" };
+
+      let energyGain = 0;
+
+      if (isCorrect) {
+        energyGain += 20; // Base energy gain
+        if (hasSpeedBonus) energyGain += 10; // Speed bonus energy
+        if (hasStreakBonus) energyGain += 5; // Streak bonus energy
+      }
+      // Note: Energy doesn't reset on wrong answer, only streak does
+
+      participant.energy_percent = Math.min(
+        100,
+        participant.energy_percent + energyGain
+      );
+
+      // Check if energy reached 100% - trigger skill selection
+      let availableSkill = null;
+      if (participant.energy_percent >= 100) {
+        availableSkill = await this.selectRandomSkill(quizSessionId, userId);
+
+        if (availableSkill) {
+          // Emit skill available notification
+          this.io
+            .to(`quiz:${quizSessionId}:${userId}`)
+            .emit("skill-available", {
+              user_id: userId,
+              skill: availableSkill,
+              energy_percent: 100,
+              timestamp: Date.now(),
+            });
+        }
+      }
+
+      // Update session data
+      await this.updateSessionData(quizSessionId, sessionData);
+
+      // Emit energy update to all participants
+      this.io.to(`quiz:${quizSessionId}`).emit("energy-update", {
+        user_id: userId,
+        energy_percent: participant.energy_percent,
+        energy_gain: energyGain,
+        skill_available: availableSkill !== null,
+        timestamp: Date.now(),
+      });
+
+      return {
+        success: true,
+        energy_percent: participant.energy_percent,
+        skill_available: availableSkill,
+      };
+    } catch (error) {
+      console.error("Error updating player energy:", error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Select random skill from user's loadout
+   */
+  async selectRandomSkill(quizSessionId, userId) {
+    try {
+      const loadoutData = await getCache(
+        `quiz_racing:${quizSessionId}:loadout:${userId}`
+      );
+      if (!loadoutData) return null;
+
+      const loadout = JSON.parse(loadoutData);
+      const availableSkills = loadout.skills.filter(
+        (skill) => !loadout.skills_used.includes(skill.skill_id)
+      );
+
+      if (availableSkills.length === 0) return null;
+
+      // Random selection from available skills
+      const randomIndex = Math.floor(Math.random() * availableSkills.length);
+      const selectedSkill = availableSkills[randomIndex];
+
+      // Update loadout with available skill
+      loadout.available_skill = selectedSkill;
+      await setCache(
+        `quiz_racing:${quizSessionId}:loadout:${userId}`,
+        JSON.stringify(loadout),
+        7200
+      );
+
+      return selectedSkill;
+    } catch (error) {
+      console.error("Error selecting random skill:", error);
+      return null;
+    }
+  }
+
+  // =====================================================
+  // SKILL EXECUTION SYSTEM
+  // =====================================================
+
+  /**
+   * Execute skill during quiz racing
+   */
+  async executeSkillInRacing(
+    quizSessionId,
+    userId,
+    skillId,
+    targetUserId = null
+  ) {
+    try {
+      const sessionData = await this.getSessionData(quizSessionId);
+      if (!sessionData) return { success: false, error: "Session not found" };
+
+      const participant = sessionData.participants.find(
+        (p) => p.user_id === userId
+      );
+      if (!participant)
+        return { success: false, error: "Participant not found" };
+
+      // Validate energy requirement
+      if (participant.energy_percent < 100) {
+        return { success: false, error: "Insufficient energy" };
+      }
+
+      // Get skill details
+      const skill = await Skill.findByPk(skillId);
+      if (!skill) return { success: false, error: "Skill not found" };
+
+      // Validate skill ownership and availability
+      const loadoutData = await getCache(
+        `quiz_racing:${quizSessionId}:loadout:${userId}`
+      );
+      if (!loadoutData) return { success: false, error: "Loadout not found" };
+
+      const loadout = JSON.parse(loadoutData);
+      const hasSkill = loadout.skills.some((s) => s.skill_id === skillId);
+      const alreadyUsed = loadout.skills_used.includes(skillId);
+
+      if (!hasSkill) return { success: false, error: "Skill not in loadout" };
+      if (alreadyUsed) return { success: false, error: "Skill already used" };
+
+      // Execute skill based on category
+      const executionResult = await this.executeSkillByCategory(
+        skill,
+        sessionData,
+        userId,
+        targetUserId
+      );
+
+      if (!executionResult.success) {
+        return executionResult;
+      }
+
+      // Reset energy to 0%
+      participant.energy_percent = 0;
+
+      // Mark skill as used
+      loadout.skills_used.push(skillId);
+      loadout.available_skill = null;
+      await setCache(
+        `quiz_racing:${quizSessionId}:loadout:${userId}`,
+        JSON.stringify(loadout),
+        7200
+      );
+
+      // Record skill usage
+      await SkillUsageHistory.create({
+        user_id: userId,
+        skill_id: skillId,
+        quiz_session_id: quizSessionId,
+        target_user_id: targetUserId,
+        execution_result: executionResult.effect_data,
+        success: executionResult.success,
+      });
+
+      // Update session data
+      await this.updateSessionData(quizSessionId, sessionData);
+
+      // Broadcast skill execution to all participants
+      this.io.to(`quiz:${quizSessionId}`).emit("skill-executed", {
+        executor_id: userId,
+        skill: skill,
+        target_id: targetUserId,
+        effect_data: executionResult.effect_data,
+        message: executionResult.message,
+        timestamp: Date.now(),
+      });
+
+      // Send personal confirmation to executor
+      this.io
+        .to(`quiz:${quizSessionId}:${userId}`)
+        .emit("skill-execution-result", {
+          success: true,
+          skill_name: skill.skill_name,
+          message: executionResult.message,
+          energy_percent: 0,
+          timestamp: Date.now(),
+        });
+
+      return { success: true, result: executionResult };
+    } catch (error) {
+      console.error("Error executing skill in racing:", error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Execute skill based on category
+   */
+  async executeSkillByCategory(skill, sessionData, userId, targetUserId) {
+    try {
+      const executor = sessionData.participants.find(
+        (p) => p.user_id === userId
+      );
+
+      switch (skill.category) {
+        case "ATTACK":
+          return await this.executeAttackSkill(
+            skill,
+            sessionData,
+            userId,
+            targetUserId
+          );
+        case "DEFENSE":
+          return await this.executeDefenseSkill(skill, sessionData, userId);
+        case "BURST":
+          return await this.executeBurstSkill(skill, sessionData, userId);
+        case "SPECIAL":
+          return await this.executeSpecialSkill(skill, sessionData, userId);
+        case "ULTIMATE":
+          return await this.executeUltimateSkill(skill, sessionData, userId);
+        default:
+          return { success: false, error: "Unknown skill category" };
+      }
+    } catch (error) {
+      console.error("Error executing skill by category:", error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Execute Attack Skills
+   */
+  async executeAttackSkill(skill, sessionData, userId, targetUserId) {
+    const participants = sessionData.participants;
+    let target = null;
+    let effectData = {};
+
+    switch (skill.skill_code) {
+      case "blackhole":
+        // Target: Current leader
+        target = participants.reduce((leader, p) =>
+          p.current_score > leader.current_score ? p : leader
+        );
+
+        // Apply blackhole effect: 0 points for 3 questions
+        await this.applyActiveEffect(
+          sessionData.quiz_session_id,
+          target.user_id,
+          skill.skill_id,
+          {
+            effect_type: "points_multiplier",
+            multiplier: 0,
+            duration_type: "QUESTIONS",
+            questions_remaining: 3,
+          }
+        );
+
+        effectData = {
+          target_id: target.user_id,
+          effect: "blackhole",
+          duration: 3,
+        };
+        break;
+
+      case "steal":
+        // Target: Player directly above executor
+        const executorPos = participants.findIndex((p) => p.user_id === userId);
+        target = executorPos > 0 ? participants[executorPos - 1] : null;
+
+        if (target) {
+          await this.applyActiveEffect(
+            sessionData.quiz_session_id,
+            userId,
+            skill.skill_id,
+            {
+              effect_type: "steal_points",
+              target_user_id: target.user_id,
+              steal_percentage: 50,
+              risk_percentage: 10,
+              duration_type: "QUESTIONS",
+              questions_remaining: 1,
+            }
+          );
+          effectData = {
+            target_id: target.user_id,
+            effect: "steal",
+            percentage: 50,
+          };
+        }
+        break;
+
+      case "break":
+        // Target: Player with highest streak (≥3)
+        target = participants
+          .filter((p) => p.current_streak >= 3)
+          .reduce(
+            (highest, p) =>
+              p.current_streak > highest.current_streak ? p : highest,
+            { current_streak: 0 }
+          );
+
+        if (target && target.current_streak >= 3) {
+          target.current_streak = 0;
+          effectData = {
+            target_id: target.user_id,
+            effect: "streak_reset",
+            old_streak: target.current_streak,
+          };
+        }
+        break;
+
+      case "slow":
+        // Target: All other players
+        const otherPlayers = participants.filter((p) => p.user_id !== userId);
+
+        for (const player of otherPlayers) {
+          await this.applyActiveEffect(
+            sessionData.quiz_session_id,
+            player.user_id,
+            skill.skill_id,
+            {
+              effect_type: "speed_reduction",
+              speed_bonus_time: 3, // Reduced from 5s to 3s
+              duration_type: "QUESTIONS",
+              questions_remaining: 2,
+            }
+          );
+        }
+
+        effectData = {
+          targets: otherPlayers.map((p) => p.user_id),
+          effect: "slow",
+          duration: 2,
+        };
+        break;
+    }
+
+    return {
+      success: true,
+      message: `${skill.skill_name} executed successfully`,
+      effect_data: effectData,
+      target_id: target?.user_id,
+    };
+  }
+
+  /**
+   * Execute Defense Skills
+   */
+  async executeDefenseSkill(skill, sessionData, userId) {
+    const executor = sessionData.participants.find((p) => p.user_id === userId);
+    let effectData = {};
+
+    switch (skill.skill_code) {
+      case "shield":
+        // Immunity to all attack skills for 45 seconds
+        await this.applyActiveEffect(
+          sessionData.quiz_session_id,
+          userId,
+          skill.skill_id,
+          {
+            effect_type: "attack_immunity",
+            duration_type: "TIME",
+            duration_seconds: 45,
+          }
+        );
+        effectData = { effect: "shield", duration: 45 };
+        break;
+
+      case "lock":
+        // Streak cannot be reset for 4 questions
+        if (executor.current_streak >= 2) {
+          await this.applyActiveEffect(
+            sessionData.quiz_session_id,
+            userId,
+            skill.skill_id,
+            {
+              effect_type: "streak_protection",
+              duration_type: "QUESTIONS",
+              questions_remaining: 4,
+            }
+          );
+          effectData = {
+            effect: "streak_lock",
+            duration: 4,
+            current_streak: executor.current_streak,
+          };
+        } else {
+          return { success: false, error: "Need streak ≥2 to use Lock skill" };
+        }
+        break;
+
+      case "cleanse":
+        // Remove all debuffs and restore 50% energy
+        await this.removeAllDebuffs(sessionData.quiz_session_id, userId);
+        executor.energy_percent = Math.min(100, executor.energy_percent + 50);
+        effectData = { effect: "cleanse", energy_restored: 50 };
+        break;
+    }
+
+    return {
+      success: true,
+      message: `${skill.skill_name} activated successfully`,
+      effect_data: effectData,
+    };
+  }
+
+  /**
+   * Execute Burst Skills (High risk/reward)
+   */
+  async executeBurstSkill(skill, sessionData, userId) {
+    const executor = sessionData.participants.find((p) => p.user_id === userId);
+    let effectData = {};
+
+    switch (skill.skill_code) {
+      case "double":
+        // Next question ×2 points if correct, -25% total if wrong
+        await this.applyActiveEffect(
+          sessionData.quiz_session_id,
+          userId,
+          skill.skill_id,
+          {
+            effect_type: "points_multiplier",
+            multiplier: 2,
+            risk_factor: 0.25,
+            duration_type: "QUESTIONS",
+            questions_remaining: 1,
+          }
+        );
+        effectData = { effect: "double", multiplier: 2, risk: 0.25 };
+        break;
+
+      case "lucky":
+        // 60% chance wrong answer still gets points (no streak)
+        await this.applyActiveEffect(
+          sessionData.quiz_session_id,
+          userId,
+          skill.skill_id,
+          {
+            effect_type: "lucky_chance",
+            success_chance: 0.6,
+            duration_type: "QUESTIONS",
+            questions_remaining: 1,
+          }
+        );
+        effectData = { effect: "lucky", chance: 60 };
+        break;
+
+      case "triple":
+        // Next question ×3 points if correct, -40% total + reset streak if wrong
+        await this.applyActiveEffect(
+          sessionData.quiz_session_id,
+          userId,
+          skill.skill_id,
+          {
+            effect_type: "points_multiplier",
+            multiplier: 3,
+            risk_factor: 0.4,
+            reset_streak_on_fail: true,
+            duration_type: "QUESTIONS",
+            questions_remaining: 1,
+          }
+        );
+        effectData = { effect: "triple", multiplier: 3, risk: 0.4 };
+        break;
+
+      case "perfect":
+        // Next question always gets 100% points + increases streak
+        await this.applyActiveEffect(
+          sessionData.quiz_session_id,
+          userId,
+          skill.skill_id,
+          {
+            effect_type: "perfect_answer",
+            guaranteed_success: true,
+            duration_type: "QUESTIONS",
+            questions_remaining: 1,
+          }
+        );
+        effectData = { effect: "perfect", guaranteed: true };
+        break;
+
+      case "quintuple":
+        // Next question ×5 points if correct, -50% total + reset streak if wrong
+        await this.applyActiveEffect(
+          sessionData.quiz_session_id,
+          userId,
+          skill.skill_id,
+          {
+            effect_type: "points_multiplier",
+            multiplier: 5,
+            risk_factor: 0.5,
+            reset_streak_on_fail: true,
+            duration_type: "QUESTIONS",
+            questions_remaining: 1,
+          }
+        );
+        effectData = { effect: "quintuple", multiplier: 5, risk: 0.5 };
+        break;
+    }
+
+    return {
+      success: true,
+      message: `${skill.skill_name} activated with risk factor`,
+      effect_data: effectData,
+    };
+  }
+
+  /**
+   * Execute Special Skills (Bypass defenses)
+   */
+  async executeSpecialSkill(skill, sessionData, userId) {
+    const participants = sessionData.participants;
+    const executor = sessionData.participants.find((p) => p.user_id === userId);
+    let effectData = {};
+
+    switch (skill.skill_code) {
+      case "swap":
+        // Swap total points with random player
+        const otherPlayers = participants.filter((p) => p.user_id !== userId);
+        if (otherPlayers.length > 0) {
+          const randomTarget =
+            otherPlayers[Math.floor(Math.random() * otherPlayers.length)];
+
+          // Swap scores
+          const tempScore = executor.current_score;
+          executor.current_score = randomTarget.current_score;
+          randomTarget.current_score = tempScore;
+
+          effectData = {
+            effect: "swap",
+            target_id: randomTarget.user_id,
+            executor_new_score: executor.current_score,
+            target_new_score: randomTarget.current_score,
+          };
+        }
+        break;
+
+      case "dice":
+        // Roll dice 1-6 for random benefits
+        const diceRoll = Math.floor(Math.random() * 6) + 1;
+
+        switch (diceRoll) {
+          case 1:
+          case 2:
+            // +30% points next question
+            await this.applyActiveEffect(
+              sessionData.quiz_session_id,
+              userId,
+              skill.skill_id,
+              {
+                effect_type: "points_bonus",
+                bonus_percentage: 30,
+                duration_type: "QUESTIONS",
+                questions_remaining: 1,
+              }
+            );
+            break;
+          case 3:
+          case 4:
+            // +40% energy
+            executor.energy_percent = Math.min(
+              100,
+              executor.energy_percent + 40
+            );
+            break;
+          case 5:
+            // ×2 current streak
+            executor.current_streak *= 2;
+            break;
+          case 6:
+            // Immunity for 25 seconds
+            await this.applyActiveEffect(
+              sessionData.quiz_session_id,
+              userId,
+              skill.skill_id,
+              {
+                effect_type: "attack_immunity",
+                duration_type: "TIME",
+                duration_seconds: 25,
+              }
+            );
+            break;
+        }
+
+        effectData = { effect: "dice", roll: diceRoll };
+        break;
+
+      case "energy":
+        // +100% energy (allows combo skills)
+        executor.energy_percent = 100;
+        effectData = { effect: "energy_boost", energy_gained: 100 };
+        break;
+    }
+
+    return {
+      success: true,
+      message: `${skill.skill_name} executed (bypasses defenses)`,
+      effect_data: effectData,
+    };
+  }
+
+  /**
+   * Execute Ultimate Skills (Game changers)
+   */
+  async executeUltimateSkill(skill, sessionData, userId) {
+    const executor = sessionData.participants.find((p) => p.user_id === userId);
+    let effectData = {};
+
+    switch (skill.skill_code) {
+      case "king":
+        // Next 3 questions: ×2 points + always correct + immunity
+        await this.applyActiveEffect(
+          sessionData.quiz_session_id,
+          userId,
+          skill.skill_id,
+          {
+            effect_type: "king_mode",
+            points_multiplier: 2,
+            guaranteed_success: true,
+            attack_immunity: true,
+            duration_type: "QUESTIONS",
+            questions_remaining: 3,
+          }
+        );
+        effectData = { effect: "king", duration: 3, multiplier: 2 };
+        break;
+
+      case "phoenix":
+        // If in bottom 3 → jump to top 3 + ×2 points for 2 questions
+        // If not in bottom 3 → lose 30% points
+        const sortedByScore = [...sessionData.participants].sort(
+          (a, b) => b.current_score - a.current_score
+        );
+        const executorRank =
+          sortedByScore.findIndex((p) => p.user_id === userId) + 1;
+        const totalPlayers = sortedByScore.length;
+        const isInBottom3 = executorRank > totalPlayers - 3;
+
+        if (isInBottom3 && totalPlayers >= 6) {
+          // Jump to top 3
+          const top3Score = sortedByScore[2].current_score;
+          executor.current_score = top3Score + 50; // Slightly above 3rd place
+
+          // ×2 points for 2 questions
+          await this.applyActiveEffect(
+            sessionData.quiz_session_id,
+            userId,
+            skill.skill_id,
+            {
+              effect_type: "points_multiplier",
+              multiplier: 2,
+              duration_type: "QUESTIONS",
+              questions_remaining: 2,
+            }
+          );
+
+          effectData = {
+            effect: "phoenix_success",
+            new_score: executor.current_score,
+            multiplier: 2,
+            duration: 2,
+          };
+        } else {
+          // Lose 30% points
+          executor.current_score = Math.floor(executor.current_score * 0.7);
+          effectData = {
+            effect: "phoenix_fail",
+            new_score: executor.current_score,
+            penalty: 30,
+          };
+        }
+        break;
+    }
+
+    return {
+      success: true,
+      message: `${skill.skill_name} - Ultimate power unleashed!`,
+      effect_data: effectData,
+    };
+  }
+
+  // =====================================================
+  // ACTIVE EFFECTS MANAGEMENT
+  // =====================================================
+
+  async applyActiveEffect(quizSessionId, userId, skillId, effectData) {
+    try {
+      const expiresAt =
+        effectData.duration_type === "TIME"
+          ? new Date(Date.now() + effectData.duration_seconds * 1000)
+          : null;
+
+      await ActiveSkillEffect.create({
+        quiz_session_id: quizSessionId,
+        affected_user_id: userId,
+        skill_id: skillId,
+        effect_data: effectData,
+        duration_type: effectData.duration_type,
+        questions_remaining: effectData.questions_remaining || null,
+        expires_at: expiresAt,
+        is_active: true,
+      });
+
+      return true;
+    } catch (error) {
+      console.error("Error applying active effect:", error);
+      return false;
+    }
+  }
+
+  async removeAllDebuffs(quizSessionId, userId) {
+    try {
+      await ActiveSkillEffect.update(
+        { is_active: false },
+        {
+          where: {
+            quiz_session_id: quizSessionId,
+            affected_user_id: userId,
+            is_active: true,
+          },
+        }
+      );
+      return true;
+    } catch (error) {
+      console.error("Error removing debuffs:", error);
+      return false;
+    }
+  }
+
+  // =====================================================
+  // HELPER METHODS
+  // =====================================================
+
+  async getSessionData(quizSessionId) {
+    try {
+      const data = await getCache(`quiz_racing:${quizSessionId}`);
+      return data ? JSON.parse(data) : null;
+    } catch (error) {
+      console.error("Error getting session data:", error);
+      return null;
+    }
+  }
+
+  async updateSessionData(quizSessionId, sessionData) {
+    try {
+      await setCache(
+        `quiz_racing:${quizSessionId}`,
+        JSON.stringify(sessionData),
+        7200
+      );
+      return true;
+    } catch (error) {
+      console.error("Error updating session data:", error);
+      return false;
+    }
+  }
+
+  // =====================================================
+  // ROUND COMPLETION SYSTEM
+  // =====================================================
+
+  /**
+   * Complete a round and handle top finisher events
+   */
+  async completeRound({
+    quiz_id,
+    user_id,
+    round_number,
+    round_score,
+    skipped_round,
+  }) {
+    try {
+      const sessionKey = `round_completion:${quiz_id}:${round_number}`;
+
+      // Get or initialize round completion data
+      let roundData = await getCache(sessionKey);
+      if (!roundData) {
+        roundData = {
+          quiz_id,
+          round_number,
+          finishers: [],
+          total_participants: 0,
+          start_time: Date.now(),
+        };
+      } else {
+        roundData = JSON.parse(roundData);
+      }
+
+      // Get user data
+      const { User } = require("../models");
+      const user = await User.findByPk(user_id);
+      if (!user) {
+        return { success: false, message: "User not found" };
+      }
+
+      // Check if user already completed this round
+      const existingFinisher = roundData.finishers.find(
+        (f) => f.user_id === user_id
+      );
+      if (existingFinisher) {
+        return {
+          success: false,
+          message: "Round already completed by this user",
+        };
+      }
+
+      // Get current total score from session
+      let totalScore = round_score;
+      try {
+        const userScoreKey = `user_total_score:${quiz_id}:${user_id}`;
+        const existingScore = await getCache(userScoreKey);
+        if (existingScore) {
+          totalScore = parseInt(existingScore) + round_score;
+        } else {
+          totalScore = round_score;
+        }
+        // Update total score
+        await setCache(userScoreKey, totalScore.toString(), 7200);
+      } catch (error) {
+        console.warn("Error updating total score:", error);
+      }
+
+      // Add finisher to round data
+      const finisher = {
+        user_id,
+        username: user.username,
+        full_name: user.name || user.username, // SỬA: Sử dụng user.name thay vì user.fullName
+        round_score,
+        total_score: totalScore,
+        finish_time: Date.now(),
+        skipped_round,
+      };
+
+      roundData.finishers.push(finisher);
+
+      // Sort finishers by score (highest first), then by time (earliest first)
+      roundData.finishers.sort((a, b) => {
+        if (a.skipped_round && !b.skipped_round) return 1;
+        if (!a.skipped_round && b.skipped_round) return -1;
+        if (a.round_score !== b.round_score)
+          return b.round_score - a.round_score;
+        return a.finish_time - b.finish_time;
+      });
+
+      // Calculate rank changes
+      const previousRank = await this.getUserPreviousRank(quiz_id, user_id);
+      const currentRank =
+        roundData.finishers.findIndex((f) => f.user_id === user_id) + 1;
+
+      const rankChange = {
+        previous_rank: previousRank,
+        current_rank: currentRank,
+        moved_up: previousRank > currentRank,
+      };
+
+      // Check if this user is in top 3 and not skipped
+      const position =
+        roundData.finishers.findIndex(
+          (f) => f.user_id === user_id && !f.skipped_round
+        ) + 1;
+
+      // Save updated round data
+      await setCache(sessionKey, JSON.stringify(roundData), 7200);
+
+      // Emit top finisher event if in top 3
+      if (position <= 3 && !skipped_round) {
+        await this.emitTopFinisherEvent(
+          quiz_id,
+          round_number,
+          finisher,
+          position
+        );
+      }
+
+      // Emit leaderboard update
+      await this.emitLeaderboardUpdate(quiz_id, roundData.finishers);
+
+      return {
+        success: true,
+        round_result: {
+          user_id,
+          username: user.username,
+          round_number,
+          round_score,
+          total_score: totalScore,
+          rank_change: rankChange,
+        },
+      };
+    } catch (error) {
+      console.error("Error completing round:", error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Emit top finisher event with celebration
+   */
+  async emitTopFinisherEvent(quiz_id, round_number, finisher, position) {
+    try {
+      const finishOrders = ["1st", "2nd", "3rd"];
+      const celebrationTypes = ["gold", "silver", "bronze"];
+      const medals = ["🥇", "🥈", "🥉"];
+
+      const eventData = {
+        type: "round_top_finisher",
+        round_number,
+        finisher: {
+          position,
+          user_id: finisher.user_id,
+          username: finisher.username,
+          full_name: finisher.full_name,
+          round_score: finisher.round_score,
+          finish_order: finishOrders[position - 1],
+        },
+        message: `${medals[position - 1]} ${finisher.full_name} về đích ${
+          finishOrders[position - 1]
+        } vòng ${round_number}!`,
+        celebration_type: celebrationTypes[position - 1],
+        timestamp: Date.now(),
+      };
+
+      // Emit to all users in the quiz
+      this.io.to(`quiz:${quiz_id}`).emit("round-top-finisher", eventData);
+
+      console.log(
+        `🏆 Top finisher event emitted: ${finisher.full_name} - Position ${position} - Round ${round_number}`
+      );
+    } catch (error) {
+      console.error("Error emitting top finisher event:", error);
+    }
+  }
+
+  /**
+   * Emit leaderboard update
+   */
+  async emitLeaderboardUpdate(quiz_id, finishers) {
+    try {
+      const leaderboardData = {
+        quiz_id,
+        leaderboard: finishers.map((f, index) => ({
+          rank: index + 1,
+          user_id: f.user_id,
+          username: f.username,
+          full_name: f.full_name,
+          total_score: f.total_score,
+          round_score: f.round_score,
+          skipped_round: f.skipped_round,
+        })),
+        timestamp: Date.now(),
+      };
+
+      this.io.to(`quiz:${quiz_id}`).emit("leaderboard-update", leaderboardData);
+    } catch (error) {
+      console.error("Error emitting leaderboard update:", error);
+    }
+  }
+
+  /**
+   * Get user's previous rank
+   */
+  async getUserPreviousRank(quiz_id, user_id) {
+    try {
+      const userRankKey = `user_rank:${quiz_id}:${user_id}`;
+      const previousRank = await getCache(userRankKey);
+      return previousRank ? parseInt(previousRank) : 999; // Default high rank if no previous data
+    } catch (error) {
+      console.warn("Error getting previous rank:", error);
+      return 999;
+    }
+  }
+}
+
+module.exports = QuizRacingService;
