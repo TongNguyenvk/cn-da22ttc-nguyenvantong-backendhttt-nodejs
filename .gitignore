@@ -11,6 +11,11 @@ yarn.lock
 .env.local
 .env.*.local
 
+# Firebase credentials
+*firebase-service-account*.json
+firebase-adminsdk*.json
+serviceAccountKey.json
+
 # Logs
 logs/
 *.log
