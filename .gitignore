@@ -61,6 +61,47 @@ temp/
 *.md
 !README.md
 
+# Test scripts và debug files
+*.ps1
+check_*.sql
+test_*.sql
+cleanup_*.sql
+backup_*.sql
+add_*.sql
+fix_*.sql
+reset_*.sql
+sequence_*.sql
+*_debug*.json
+*_response*.json
+*test*.json
+!package.json
+!config.json
+!tsconfig.json
+
+# Postman collections (không cần trong production)
+*.postman_collection.json
+*.postman_environment.json
+*.postman_request.json
+postman/
+postman_collections/
+
+# Sample data và test docs
+sample_data/
+test_docs/
+semesters_from_pdf.json
+subjects_from_pdf.json
+analytics_*.json
+
+# Migration scripts tạm thời
+migrations/run-*.ps1
+migrations/check_*.sql
+migrations/backup_*.sql
+
+# C/C++ files không cần thiết
+*.cpp
+*.o
+*.exe
+
 # Database
 *.sqlite
 *.sqlite3
